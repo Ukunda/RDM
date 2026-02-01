@@ -14,3 +14,5 @@ dist/
 # Virtual Environments
 venv/
 env/
+
+config.json

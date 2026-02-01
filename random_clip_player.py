@@ -1,19 +1,21 @@
 """
 Random Clip Player - A polished video clip player with random playback
-Version 2.0 - Production Ready
+Version 2.1 - Initial Public Release
 """
 
 import sys
 import os
+import json
 import random
 import ctypes
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QPushButton, QSlider, QLabel, QFrame, QSizePolicy, QShortcut
+    QPushButton, QSlider, QLabel, QFrame, QSizePolicy, QShortcut,
+    QFileDialog, QAction, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QKeySequence
+from PyQt5.QtGui import QFont, QKeySequence, QIcon
 
 # ============================================================================
 # VLC Detection and Setup
@@ -113,6 +115,47 @@ COLORS = {
     'text_muted': '#484f58',
     'border': '#30363d',
 }
+
+# ============================================================================
+# Configuration Management
+# ============================================================================
+
+class ConfigManager:
+    """Handles loading and saving of application settings"""
+    
+    def __init__(self):
+        self.config_file = Path("config.json")
+        self.default_config = {
+            "clips_folder": "",
+            "volume": 80,
+            "last_played": []
+        }
+        self.config = self.load_config()
+
+    def load_config(self):
+        """Load config from JSON file or return defaults"""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    return {**self.default_config, **json.load(f)}
+            except Exception:
+                return self.default_config.copy()
+        return self.default_config.copy()
+
+    def save_config(self):
+        """Save current config to JSON file"""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=4)
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+
+    def get(self, key):
+        return self.config.get(key)
+
+    def set(self, key, value):
+        self.config[key] = value
+        self.save_config()
 
 # ============================================================================
 # Custom Widgets
@@ -234,41 +277,102 @@ class VideoPlayer(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Random Clip Player")
+        self.setWindowTitle("Random Clip Player v2.1")
         self.setGeometry(100, 100, 1100, 700)
         self.setMinimumSize(800, 550)
+        
+        # Initialize Configuration
+        self.config_manager = ConfigManager()
         
         # VLC instance and player
         self.instance = vlc.Instance('--no-xlib')
         self.player = self.instance.media_player_new()
         
-        # Folder path for clips
-        self.clips_folder = r"C:\Medal\Clips\Tom Clancys Rainbow Six Siege"
+        # Folder path from config
+        self.clips_folder = self.config_manager.get("clips_folder")
         self.video_files = []
         self.current_video = ""
         
-        # History tracking for clip navigation
+        # History tracking
         self.clip_history = []
         self.history_index = -1
         self.played_clips = set()
         
         # UI state
         self.is_slider_pressed = False
-        self._last_volume = 80
+        self._last_volume = self.config_manager.get("volume")
         
         # Setup UI
         self._setup_ui()
+        self._create_menu_bar()
         self._apply_global_styles()
         self._setup_keyboard_shortcuts()
         
-        # Scan folder and update UI
-        self.scan_folder()
-        self._update_status_bar()
+        # Initial folder check
+        if not self.clips_folder or not os.path.exists(self.clips_folder):
+            self.video_label.setText("⚠  Please select a clips folder to begin")
+            QTimer.singleShot(500, self.select_folder) # Delay slightly to let UI render
+        else:
+            self.scan_folder()
+            self._update_status_bar()
         
         # Timer for updating slider and time (smoother at 20fps)
         self.timer = QTimer(self)
         self.timer.setInterval(50)
         self.timer.timeout.connect(self._update_playback_ui)
+
+    def _create_menu_bar(self):
+        """Create the application menu bar"""
+        navbar = self.menuBar()
+        navbar.setStyleSheet(f"""
+            QMenuBar {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_primary']};
+                border-bottom: 1px solid {COLORS['border']};
+            }}
+            QMenuBar::item {{
+                padding: 8px 12px;
+                background-color: transparent;
+            }}
+            QMenuBar::item:selected {{
+                background-color: {COLORS['accent_blue']};
+            }}
+            QMenu {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+            }}
+            QMenu::item {{
+                padding: 6px 24px;
+            }}
+            QMenu::item:selected {{
+                background-color: {COLORS['accent_blue']};
+            }}
+        """)
+        
+        # File Menu
+        file_menu = navbar.addMenu("File")
+        
+        open_action = QAction("Open Folder...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self.select_folder)
+        file_menu.addAction(open_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("Exit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+    def select_folder(self):
+        """Open dialog to select clips folder"""
+        folder = QFileDialog.getExistingDirectory(self, "Select Clips Folder")
+        if folder:
+            self.clips_folder = folder
+            self.config_manager.set("clips_folder", folder)
+            self.scan_folder()
+            self._update_status_bar()
 
     def _setup_ui(self):
         """Initialize all UI components"""
@@ -411,12 +515,12 @@ class VideoPlayer(QMainWindow):
         
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(80)
+        self.volume_slider.setValue(self._last_volume)
         self.volume_slider.setFixedWidth(90)
         self.volume_slider.valueChanged.connect(self._set_volume)
         self.volume_slider.setToolTip("Volume (↑/↓)")
         
-        self.volume_label = QLabel("80%")
+        self.volume_label = QLabel(f"{self._last_volume}%")
         self.volume_label.setStyleSheet(f"""
             color: {COLORS['text_muted']};
             font-size: 12px;
@@ -456,7 +560,7 @@ class VideoPlayer(QMainWindow):
         main_layout.addLayout(controls_layout)
         
         # Set initial volume
-        self.player.audio_set_volume(80)
+        self.player.audio_set_volume(self._last_volume)
 
     def _apply_global_styles(self):
         """Apply global application styles"""
@@ -690,6 +794,9 @@ class VideoPlayer(QMainWindow):
         """Set audio volume"""
         self.player.audio_set_volume(volume)
         self.volume_label.setText(f"{volume}%")
+        
+        # Save volume preference
+        self.config_manager.set("volume", volume)
         
         # Update icon based on volume level
         if volume == 0:

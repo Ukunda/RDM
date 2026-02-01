@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['d:\\Hobbies\\RDM\\random_clip_player.py'],
+    ['random_clip_player.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='NONE',
 )
