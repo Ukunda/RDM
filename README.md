@@ -4,13 +4,16 @@ A polished desktop application for playing random video clips from a selected fo
 
 ## Features
 
-- **🎲 Random Playback:** One-click random clip selection
+- **🎲 Shuffle Queue:** True shuffle - see every clip once before reshuffling
+- **▶️ Autoplay:** Automatically play the next random clip when current ends
+- **📂 Open in Explorer:** Quickly locate current clip in Windows Explorer (Ctrl+E)
+- **👍 Like/Dislike:** Mark favorites and block clips you don't want to see
 - **📁 Folder Management:** Select any folder containing video files
 - **⏯ Playback Controls:** Play/Pause, Skip 10s, Previous Clip
 - **🐢 Slow Motion:** Toggle 0.5x speed for analyzing plays
 - **🔊 Volume Memory:** Remembers your volume settings between sessions
-- **⌨ Keyboard Shortcuts:** Full keyboard control (Space, Arrows, P, S, M)
-- **🎨 Modern Dark UI:** Clean, distraction-free interface
+- **⌨ Keyboard Shortcuts:** Full keyboard control
+- **🎨 Modern Dark UI:** Clean, GitHub-inspired dark theme
 
 ## Supported Formats
 Supports most common video formats including:
@@ -34,7 +37,11 @@ Supports most common video formats including:
 |:-:|---|
 | **Space** | Play Random Clip |
 | **P** | Play / Pause |
+| **A** | Toggle Autoplay |
 | **S** | Toggle Slow Motion |
+| **L** | Like Current Clip |
+| **Del** | Dislike & Block Clip |
+| **Ctrl+E** | Open in Explorer |
 | **← / →** | Skip Back / Forward 10s |
 | **Backspace** | Previous Clip |
 | **M** | Mute |

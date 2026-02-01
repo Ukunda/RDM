@@ -1,6 +1,6 @@
 """
 Random Clip Player - A polished video clip player with random playback
-Version 2.1 - Initial Public Release
+Version 2.2 - Shuffle Queue & Autoplay
 """
 
 import sys
@@ -12,7 +12,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QSlider, QLabel, QFrame, QSizePolicy, QShortcut,
-    QFileDialog, QAction, QMessageBox
+    QFileDialog, QAction, QMessageBox, QDialog, QListWidget, QListWidgetItem
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QKeySequence, QIcon
@@ -128,7 +128,9 @@ class ConfigManager:
         self.default_config = {
             "clips_folder": "",
             "volume": 80,
-            "last_played": []
+            "blocked_clips": [],
+            "liked_clips": [],
+            "autoplay": False
         }
         self.config = self.load_config()
 
@@ -156,6 +158,94 @@ class ConfigManager:
     def set(self, key, value):
         self.config[key] = value
         self.save_config()
+
+class BlockedListDialog(QDialog):
+    """Dialog to manage blocked clips"""
+    
+    def __init__(self, blocked_clips, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Blocked Clips")
+        self.setMinimumSize(500, 400)
+        self.blocked_clips = sorted(list(blocked_clips))
+        self.removed_clips = set()
+        
+        layout = QVBoxLayout(self)
+        
+        # Info label
+        layout.addWidget(QLabel("Select clips to unblock:"))
+        
+        # List widget
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+        
+        for clip in self.blocked_clips:
+            item = QListWidgetItem(os.path.basename(clip))
+            item.setData(Qt.UserRole, clip)
+            self.list_widget.addItem(item)
+            
+        layout.addWidget(self.list_widget)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        unblock_btn = QPushButton("Unblock Selected")
+        unblock_btn.clicked.connect(self.unblock_selected)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        
+        btn_layout.addWidget(unblock_btn)
+        btn_layout.addWidget(close_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        self.apply_styles()
+        
+    def unblock_selected(self):
+        selected_items = self.list_widget.selectedItems()
+        for item in selected_items:
+            clip_path = item.data(Qt.UserRole)
+            self.removed_clips.add(clip_path)
+            self.list_widget.takeItem(self.list_widget.row(item))
+            
+    def get_removed_clips(self):
+        return self.removed_clips
+
+    def apply_styles(self):
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {COLORS['bg_dark']};
+                color: {COLORS['text_primary']};
+            }}
+            QListWidget {{
+                background-color: {COLORS['bg_medium']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                color: {COLORS['text_primary']};
+                padding: 4px;
+            }}
+            QListWidget::item {{
+                padding: 4px;
+            }}
+            QListWidget::item:selected {{
+                background-color: {COLORS['accent_blue']};
+                color: {COLORS['text_primary']};
+            }}
+            QPushButton {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 6px 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['bg_medium']};
+                border-color: {COLORS['text_muted']};
+            }}
+            QLabel {{
+                color: {COLORS['text_primary']};
+            }}
+        """)
 
 # ============================================================================
 # Custom Widgets
@@ -290,13 +380,15 @@ class VideoPlayer(QMainWindow):
         
         # Folder path from config
         self.clips_folder = self.config_manager.get("clips_folder")
+        self.blocked_clips = set(self.config_manager.get("blocked_clips") or [])
+        self.liked_clips = set(self.config_manager.get("liked_clips") or [])
         self.video_files = []
         self.current_video = ""
         
         # History tracking
-        self.clip_history = []
-        self.history_index = -1
-        self.played_clips = set()
+        self.autoplay_enabled = self.config_manager.get("autoplay")
+        self.play_queue = [] # Shuffled list of clips
+        self.queue_index = -1 # Current position in shuffled list
         
         # UI state
         self.is_slider_pressed = False
@@ -359,6 +451,17 @@ class VideoPlayer(QMainWindow):
         file_menu.addAction(open_action)
         
         file_menu.addSeparator()
+
+        open_explorer_action = QAction("Open in Explorer", self)
+        open_explorer_action.setShortcut("Ctrl+E")
+        open_explorer_action.triggered.connect(self.open_current_in_explorer)
+        file_menu.addAction(open_explorer_action)
+
+        manage_blocked_action = QAction("Manage Blocked Clips...", self)
+        manage_blocked_action.triggered.connect(self.show_blocked_dialog)
+        file_menu.addAction(manage_blocked_action)
+        
+        file_menu.addSeparator()
         
         exit_action = QAction("Exit", self)
         exit_action.setShortcut("Ctrl+Q")
@@ -374,51 +477,55 @@ class VideoPlayer(QMainWindow):
             self.scan_folder()
             self._update_status_bar()
 
+    def show_blocked_dialog(self):
+        """Show dialog to manage blocked clips"""
+        dialog = BlockedListDialog(self.blocked_clips, self)
+        if dialog.exec_():
+            removed = dialog.get_removed_clips()
+            if removed:
+                self.blocked_clips -= removed
+                self.config_manager.set("blocked_clips", list(self.blocked_clips))
+                self.video_label.setText(f"✅ Unblocked {len(removed)} clips")
+                QTimer.singleShot(2000, lambda: self._update_status_bar() if not self.current_video else None)
+
     def _setup_ui(self):
         """Initialize all UI components"""
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(6)
         
-        # Video container with subtle border
+        # Video container
         video_container = QFrame()
         video_container.setStyleSheet(f"""
             QFrame {{
                 background-color: #000000;
                 border: 1px solid {COLORS['border']};
-                border-radius: 12px;
+                border-radius: 6px;
             }}
         """)
         video_layout = QVBoxLayout(video_container)
-        video_layout.setContentsMargins(2, 2, 2, 2)
+        video_layout.setContentsMargins(1, 1, 1, 1)
         
         self.video_frame = QFrame()
-        self.video_frame.setStyleSheet("background-color: #000000; border-radius: 10px;")
+        self.video_frame.setStyleSheet("background-color: #000000; border-radius: 4px;")
         self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         video_layout.addWidget(self.video_frame)
         
         main_layout.addWidget(video_container, stretch=1)
         
-        # Info bar
+        # Info bar (filename left, status right)
         info_layout = QHBoxLayout()
-        info_layout.setContentsMargins(4, 0, 4, 0)
+        info_layout.setContentsMargins(2, 2, 2, 2)
+        info_layout.setSpacing(8)
         
-        self.video_label = QLabel("Ready — Press Space or click Random Clip to start")
-        self.video_label.setStyleSheet(f"""
-            color: {COLORS['text_secondary']};
-            font-size: 13px;
-            padding: 6px 4px;
-        """)
+        self.video_label = QLabel("Ready — Press Space to start")
+        self.video_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
         
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet(f"""
-            color: {COLORS['text_muted']};
-            font-size: 12px;
-            padding: 6px 4px;
-        """)
+        self.status_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
         self.status_label.setAlignment(Qt.AlignRight)
         
         info_layout.addWidget(self.video_label, stretch=1)
@@ -427,16 +534,12 @@ class VideoPlayer(QMainWindow):
         
         # Progress bar section
         progress_layout = QHBoxLayout()
-        progress_layout.setSpacing(14)
+        progress_layout.setSpacing(8)
+        progress_layout.setContentsMargins(0, 0, 0, 0)
         
         self.time_label = QLabel("0:00")
-        self.time_label.setStyleSheet(f"""
-            color: {COLORS['text_primary']};
-            font-size: 13px;
-            font-weight: 500;
-            font-family: 'Consolas', 'SF Mono', monospace;
-        """)
-        self.time_label.setMinimumWidth(50)
+        self.time_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 11px; font-family: 'Consolas', monospace;")
+        self.time_label.setFixedWidth(40)
         self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         
         self.time_slider = ClickableSlider(Qt.Horizontal)
@@ -446,116 +549,122 @@ class VideoPlayer(QMainWindow):
         self.time_slider.sliderReleased.connect(self._slider_released)
         
         self.duration_label = QLabel("0:00")
-        self.duration_label.setStyleSheet(f"""
-            color: {COLORS['text_secondary']};
-            font-size: 13px;
-            font-family: 'Consolas', 'SF Mono', monospace;
-        """)
-        self.duration_label.setMinimumWidth(50)
+        self.duration_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; font-family: 'Consolas', monospace;")
+        self.duration_label.setFixedWidth(40)
         
         progress_layout.addWidget(self.time_label)
         progress_layout.addWidget(self.time_slider, stretch=1)
         progress_layout.addWidget(self.duration_label)
         main_layout.addLayout(progress_layout)
         
-        # Main controls row
+        # ==========================================
+        # Main Controls Row
+        # ==========================================
         controls_layout = QHBoxLayout()
-        controls_layout.setSpacing(10)
+        controls_layout.setSpacing(4)
+        controls_layout.setContentsMargins(0, 4, 0, 0)
         
-        # Previous clip button
-        self.prev_clip_btn = StyledButton("⏮  Previous", 'secondary')
+        # Previous clip
+        self.prev_clip_btn = StyledButton("⏮ Prev", 'secondary')
+        self.prev_clip_btn.setMinimumSize(75, 36)
         self.prev_clip_btn.clicked.connect(self.play_previous_clip)
         self.prev_clip_btn.setEnabled(False)
-        self.prev_clip_btn.setToolTip("Previous clip (Backspace)")
-        controls_layout.addWidget(self.prev_clip_btn)
+        self.prev_clip_btn.setToolTip("Previous (Backspace)")
+        controls_layout.addWidget(self.prev_clip_btn, stretch=1)
         
-        # Main random button
-        self.random_btn = StyledButton("🎲  Random Clip", 'primary')
-        self.random_btn.clicked.connect(self.play_random_clip)
-        self.random_btn.setToolTip("Play random clip (Space)")
-        self.random_btn.setMinimumWidth(180)
-        controls_layout.addWidget(self.random_btn, stretch=2)
-        
-        controls_layout.addSpacing(12)
-        
-        # Playback controls
-        self.skip_back_btn = StyledButton("⏪ 10s")
+        # Skip back
+        self.skip_back_btn = StyledButton("−10s")
+        self.skip_back_btn.setMinimumSize(50, 36)
         self.skip_back_btn.clicked.connect(lambda: self._skip(-10000))
-        self.skip_back_btn.setToolTip("Skip back 10s (←)")
-        controls_layout.addWidget(self.skip_back_btn)
+        self.skip_back_btn.setToolTip("Skip back (←)")
+        controls_layout.addWidget(self.skip_back_btn, stretch=1)
         
-        self.play_btn = StyledButton("▶  Play")
+        # Play/Pause
+        self.play_btn = StyledButton("▶ Play")
+        self.play_btn.setMinimumSize(80, 36)
         self.play_btn.clicked.connect(self._toggle_play_pause)
         self.play_btn.setToolTip("Play/Pause (P)")
-        self.play_btn.setMinimumWidth(100)
-        controls_layout.addWidget(self.play_btn)
+        controls_layout.addWidget(self.play_btn, stretch=1)
         
-        self.skip_fwd_btn = StyledButton("10s ⏩")
+        # Skip forward
+        self.skip_fwd_btn = StyledButton("+10s")
+        self.skip_fwd_btn.setMinimumSize(50, 36)
         self.skip_fwd_btn.clicked.connect(lambda: self._skip(10000))
-        self.skip_fwd_btn.setToolTip("Skip forward 10s (→)")
-        controls_layout.addWidget(self.skip_fwd_btn)
+        self.skip_fwd_btn.setToolTip("Skip forward (→)")
+        controls_layout.addWidget(self.skip_fwd_btn, stretch=1)
         
-        controls_layout.addSpacing(12)
+        controls_layout.addSpacing(8)
         
-        # Speed toggle
-        self.slow_mo_btn = StyledButton("🐢 0.5x", 'toggle')
+        # ★ RANDOM CLIP - PRIMARY ACTION ★
+        self.random_btn = StyledButton("🎲 Random Clip", 'primary')
+        self.random_btn.setMinimumSize(130, 40)
+        self.random_btn.clicked.connect(self.play_random_clip)
+        self.random_btn.setToolTip("Next random clip (Space)")
+        controls_layout.addWidget(self.random_btn, stretch=3)
+        
+        controls_layout.addSpacing(8)
+        
+        # Like/Dislike
+        self.like_btn = StyledButton("👍")
+        self.like_btn.setMinimumSize(40, 36)
+        self.like_btn.clicked.connect(self.toggle_like)
+        self.like_btn.setToolTip("Like (L)")
+        self.like_btn.setEnabled(False)
+        controls_layout.addWidget(self.like_btn, stretch=1)
+        
+        self.block_btn = StyledButton("👎")
+        self.block_btn.setMinimumSize(40, 36)
+        self.block_btn.clicked.connect(self.block_current_clip)
+        self.block_btn.setToolTip("Dislike & Block (Del)")
+        self.block_btn.setEnabled(False)
+        controls_layout.addWidget(self.block_btn, stretch=1)
+        
+        controls_layout.addSpacing(8)
+        
+        # Settings toggles
+        self.autoplay_btn = StyledButton("Auto", 'toggle')
+        self.autoplay_btn.setMinimumSize(50, 36)
+        self.autoplay_btn.setCheckable(True)
+        self.autoplay_btn.setChecked(self.autoplay_enabled)
+        self.autoplay_btn.clicked.connect(self.toggle_autoplay)
+        self.autoplay_btn.setToolTip("Autoplay (A)")
+        controls_layout.addWidget(self.autoplay_btn, stretch=1)
+        
+        self.slow_mo_btn = StyledButton("0.5x", 'toggle')
+        self.slow_mo_btn.setMinimumSize(45, 36)
         self.slow_mo_btn.setCheckable(True)
         self.slow_mo_btn.clicked.connect(self._toggle_slow_motion)
         self.slow_mo_btn.setToolTip("Slow motion (S)")
-        controls_layout.addWidget(self.slow_mo_btn)
+        controls_layout.addWidget(self.slow_mo_btn, stretch=1)
         
-        # Volume section
-        volume_widget = QWidget()
-        volume_layout = QHBoxLayout(volume_widget)
-        volume_layout.setContentsMargins(12, 0, 0, 0)
-        volume_layout.setSpacing(8)
+        controls_layout.addSpacing(8)
         
+        # Volume
         self.volume_icon = QLabel("🔊")
-        self.volume_icon.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 16px;")
+        self.volume_icon.setFixedWidth(16)
+        controls_layout.addWidget(self.volume_icon)
         
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(self._last_volume)
-        self.volume_slider.setFixedWidth(90)
+        self.volume_slider.setMinimumWidth(50)
+        self.volume_slider.setMaximumWidth(80)
         self.volume_slider.valueChanged.connect(self._set_volume)
         self.volume_slider.setToolTip("Volume (↑/↓)")
+        controls_layout.addWidget(self.volume_slider)
         
         self.volume_label = QLabel(f"{self._last_volume}%")
-        self.volume_label.setStyleSheet(f"""
-            color: {COLORS['text_muted']};
-            font-size: 12px;
-            min-width: 36px;
-        """)
+        self.volume_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px;")
+        self.volume_label.setFixedWidth(30)
+        controls_layout.addWidget(self.volume_label)
         
-        volume_layout.addWidget(self.volume_icon)
-        volume_layout.addWidget(self.volume_slider)
-        volume_layout.addWidget(self.volume_label)
-        controls_layout.addWidget(volume_widget)
-        
-        # Clip counter badge
-        counter_frame = QFrame()
-        counter_frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: {COLORS['bg_light']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 8px;
-                padding: 4px;
-            }}
-        """)
-        counter_layout = QHBoxLayout(counter_frame)
-        counter_layout.setContentsMargins(12, 6, 12, 6)
-        
+        # Clip Counter
         self.clip_counter = QLabel("0 / 0")
-        self.clip_counter.setStyleSheet(f"""
-            color: {COLORS['accent_green']};
-            font-size: 14px;
-            font-weight: 700;
-        """)
-        self.clip_counter.setAlignment(Qt.AlignCenter)
-        self.clip_counter.setToolTip("Clips played / Total clips")
-        counter_layout.addWidget(self.clip_counter)
-        
-        controls_layout.addWidget(counter_frame)
+        self.clip_counter.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 11px; font-weight: bold;")
+        self.clip_counter.setMinimumWidth(70)
+        self.clip_counter.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.clip_counter.setToolTip("Position / Total clips")
+        controls_layout.addWidget(self.clip_counter)
         
         main_layout.addLayout(controls_layout)
         
@@ -571,7 +680,7 @@ class VideoPlayer(QMainWindow):
             QWidget {{
                 background-color: transparent;
                 color: {COLORS['text_primary']};
-                font-family: 'Segoe UI', 'SF Pro Display', -apple-system, sans-serif;
+                font-family: 'Segoe UI', sans-serif;
             }}
             QMainWindow > QWidget {{
                 background-color: {COLORS['bg_dark']};
@@ -585,25 +694,24 @@ class VideoPlayer(QMainWindow):
                 font-size: 12px;
             }}
             QSlider::groove:horizontal {{
-                height: 8px;
+                height: 6px;
                 background: {COLORS['bg_light']};
-                border-radius: 4px;
+                border-radius: 3px;
             }}
             QSlider::handle:horizontal {{
                 background: {COLORS['text_primary']};
                 border: none;
-                width: 16px;
-                height: 16px;
+                width: 14px;
+                height: 14px;
                 margin: -4px 0;
-                border-radius: 8px;
+                border-radius: 7px;
             }}
             QSlider::handle:horizontal:hover {{
                 background: {COLORS['accent_green']};
-                transform: scale(1.1);
             }}
             QSlider::sub-page:horizontal {{
                 background: {COLORS['accent_green']};
-                border-radius: 4px;
+                border-radius: 3px;
             }}
         """)
 
@@ -621,6 +729,10 @@ class VideoPlayer(QMainWindow):
             (Qt.Key_M, self._toggle_mute),
             (Qt.Key_Escape, self._stop),
             (Qt.Key_R, self._reset_cycle),
+            (Qt.Key_Delete, self.block_current_clip),
+            (Qt.Key_L, self.toggle_like),
+            (Qt.Key_E, self.open_current_in_explorer),
+            (Qt.Key_A, self.toggle_autoplay),
         ]
         
         for key, callback in shortcuts:
@@ -644,53 +756,174 @@ class VideoPlayer(QMainWindow):
             if file.suffix.lower() in VIDEO_EXTENSIONS:
                 self.video_files.append(str(file))
         
+        # Prepare shuffled queue
+        self._refresh_queue()
+        
         count = len(self.video_files)
         self.video_label.setText(f"📁  Found {count:,} clips — Ready to play")
         self.video_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px; padding: 6px 4px;")
         self._update_clip_counter()
 
-    def play_random_clip(self):
-        """Play a random clip that hasn't been played yet"""
-        if not self.video_files:
-            self.video_label.setText("⚠  No video files found in folder")
-            self.video_label.setStyleSheet(f"color: {COLORS['accent_red']}; font-size: 13px; padding: 6px 4px;")
-            return
+    def _refresh_queue(self):
+        """Create a new shuffled queue of available clips"""
+        available_clips = [
+            f for f in self.video_files 
+            if f not in self.blocked_clips
+        ]
         
-        # Get available clips (not yet played)
-        available_clips = [f for f in self.video_files if f not in self.played_clips]
-        
-        # Reset if all clips have been played
         if not available_clips:
-            self.played_clips.clear()
-            available_clips = self.video_files.copy()
-            self.video_label.setText("🔄  All clips played! Starting fresh cycle...")
+            self.play_queue = []
+            self.queue_index = -1
+            return
+
+        random.shuffle(available_clips)
+        self.play_queue = available_clips
+        self.queue_index = -1
+
+    def _update_navigation_state(self):
+        """Update state of navigation and rating buttons"""
+        self.prev_clip_btn.setEnabled(self.queue_index > 0)
         
-        # Select random clip
-        self.current_video = random.choice(available_clips)
-        self.played_clips.add(self.current_video)
+        has_video = bool(self.current_video)
+        self.block_btn.setEnabled(has_video)
+        self.like_btn.setEnabled(has_video)
         
-        # Manage history - truncate if navigating back
-        if self.history_index >= 0 and self.history_index < len(self.clip_history) - 1:
-            self.clip_history = self.clip_history[:self.history_index + 1]
+        # Update Like button visual state (green when liked)
+        if has_video and self.current_video in self.liked_clips:
+            self.like_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLORS['accent_green']};
+                    color: {COLORS['text_primary']};
+                    font-size: 14px;
+                    border: none;
+                    border-radius: 4px;
+                }}
+            """)
+        else:
+            self.like_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLORS['bg_light']};
+                    color: {COLORS['text_muted']};
+                    font-size: 14px;
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 4px;
+                }}
+                QPushButton:hover {{
+                    background-color: {COLORS['bg_medium']};
+                    border-color: {COLORS['accent_green']};
+                    color: {COLORS['accent_green']};
+                }}
+                QPushButton:disabled {{
+                    background-color: {COLORS['bg_medium']};
+                    color: {COLORS['text_muted']};
+                }}
+            """)
         
-        self.clip_history.append(self.current_video)
-        self.history_index = len(self.clip_history) - 1
+        self._update_clip_counter()
+        self._update_status_bar()
+
+    def play_random_clip(self):
+        """Play next random clip from shuffled queue"""
+        if not self.play_queue:
+            # Try to refresh if empty (maybe files were added or blocks removed)
+            self._refresh_queue()
+            
+            if not self.play_queue:
+                self.video_label.setText("⚠  No playable clips found (check blocked list)")
+                self.video_label.setStyleSheet(f"color: {COLORS['accent_orange']}; font-size: 13px; padding: 6px 4px;")
+                return
+
+        # Advance index
+        self.queue_index += 1
         
+        # If we reached the end, reshuffle and start over
+        if self.queue_index >= len(self.play_queue):
+            self.video_label.setText("🔄  All clips played! Reshuffling...")
+            random.shuffle(self.play_queue)
+            self.queue_index = 0
+            
+        self.current_video = self.play_queue[self.queue_index]
         self._update_navigation_state()
         self._play_video(self.current_video)
 
     def play_previous_clip(self):
-        """Navigate to the previous clip in history"""
-        if self.history_index > 0:
-            self.history_index -= 1
-            self.current_video = self.clip_history[self.history_index]
+        """Navigate to the previous clip in queue"""
+        if self.queue_index > 0:
+            self.queue_index -= 1
+            self.current_video = self.play_queue[self.queue_index]
             self._update_navigation_state()
             self._play_video(self.current_video)
 
+    def toggle_autoplay(self):
+        self.autoplay_enabled = self.autoplay_btn.isChecked()
+        self.config_manager.set("autoplay", self.autoplay_enabled)
+        state = "enabled" if self.autoplay_enabled else "disabled"
+        self.status_label.setText(f"Autoplay {state}")
+        QTimer.singleShot(1500, self._update_status_bar)
+
+    def open_current_in_explorer(self):
+        """Open the folder containing the current clip"""
+        if self.current_video and os.path.exists(self.current_video):
+            # Select the file in explorer
+            subprocess_args = f'/select,"{self.current_video}"'
+            try:
+                # Use standard Windows command
+                ctypes.windll.shell32.ShellExecuteW(
+                    None, "open", "explorer.exe", subprocess_args, None, 1
+                )
+            except Exception as e:
+                self.status_label.setText("⚠ Failed to open explorer")
+                print(f"Explorer error: {e}")
+
+    def toggle_like(self):
+        """Toggle like status for current clip"""
+        if not self.current_video:
+            return
+            
+        if self.current_video in self.liked_clips:
+            self.liked_clips.remove(self.current_video)
+            self.status_label.setText("💔 Like removed")
+        else:
+            self.liked_clips.add(self.current_video)
+            self.status_label.setText("♥ Liked!")
+            
+        self.config_manager.set("liked_clips", list(self.liked_clips))
+        self._update_navigation_state()
+        QTimer.singleShot(1500, self._update_status_bar)
+
+    def block_current_clip(self):
+        """Add current clip to blocked list and skip to next"""
+        if not self.current_video:
+            return
+            
+        # Confirm blocking (Dislike)
+        reply = QMessageBox.question(
+            self, 
+            "Dislike Clip", 
+            "Dislike this clip?\nIt won't be shown in random playback again.",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.blocked_clips.add(self.current_video)
+            self.config_manager.set("blocked_clips", list(self.blocked_clips))
+            
+            # Remove from likes if present
+            if self.current_video in self.liked_clips:
+                self.liked_clips.remove(self.current_video)
+                self.config_manager.set("liked_clips", list(self.liked_clips))
+            
+            self.status_label.setText("👎 Clip disliked")
+            QTimer.singleShot(2000, self._update_status_bar)
+            
+            # Immediately play next random clip
+            self.play_random_clip()
+
     def _reset_cycle(self):
-        """Reset the played clips to start fresh"""
-        self.played_clips.clear()
-        self.video_label.setText("🔄  Cycle reset — All clips available again")
+        """Reshuffle the queue"""
+        self._refresh_queue()
+        self.video_label.setText("🔀  Queue reshuffled")
         self._update_clip_counter()
         self._update_status_bar()
 
@@ -835,29 +1068,34 @@ class VideoPlayer(QMainWindow):
         # Handle video end
         state = self.player.get_state()
         if state == vlc.State.Ended:
-            self.timer.stop()
-            self.play_btn.setText("▶  Play")
-
-    def _update_navigation_state(self):
-        """Update navigation buttons and related UI"""
-        self.prev_clip_btn.setEnabled(self.history_index > 0)
-        self._update_clip_counter()
-        self._update_status_bar()
+            if self.autoplay_enabled:
+                QTimer.singleShot(50, self.play_random_clip)
+            else:
+                self.timer.stop()
+                self.play_btn.setText("▶  Play")
 
     def _update_clip_counter(self):
         """Update the clip counter display"""
-        played = len(self.played_clips)
-        total = len(self.video_files)
-        self.clip_counter.setText(f"{played} / {total}")
+        if not self.play_queue:
+             self.clip_counter.setText("0 / 0")
+             return
+             
+        current = self.queue_index + 1
+        total = len(self.play_queue)
+        self.clip_counter.setText(f"{current} / {total}")
 
     def _update_status_bar(self):
         """Update the status bar with current state info"""
-        remaining = len(self.video_files) - len(self.played_clips)
+        if not self.play_queue:
+            self.status_label.setText("Ready")
+            return
+            
+        remaining = len(self.play_queue) - (self.queue_index + 1)
         
         parts = [f"{remaining:,} remaining"]
         
-        if self.history_index >= 0 and len(self.clip_history) > 1:
-            parts.append(f"History {self.history_index + 1}/{len(self.clip_history)}")
+        if self.autoplay_enabled:
+            parts.append("Autoplay ON")
         
         self.status_label.setText("  •  ".join(parts))
 
