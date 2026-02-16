@@ -1,6 +1,6 @@
 """
 Random Clip Player - A polished video clip player with random playback
-Version 3.0 - Settings & Customization
+Version 4.0 - Watch Together
 """
 
 import sys
@@ -8,6 +8,9 @@ import os
 import json
 import random
 import ctypes
+import argparse
+import logging
+import traceback
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -15,8 +18,15 @@ from PyQt5.QtWidgets import (
     QFileDialog, QAction, QMessageBox, QDialog, QListWidget, QListWidgetItem,
     QScrollArea
 )
-from PyQt5.QtCore import Qt, QTimer, QMimeData, QPoint, QPropertyAnimation, QEasingCurve
+from PyQt5.QtCore import Qt, QTimer, QMimeData, QPoint, QPropertyAnimation, QEasingCurve, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence, QIcon, QDrag, QPixmap, QPainter
+
+# Session (Watch Together) support — imported lazily to keep solo mode clean
+try:
+    from session_client import SessionClient
+    SESSION_AVAILABLE = True
+except ImportError:
+    SESSION_AVAILABLE = False
 
 # ============================================================================
 # VLC Detection and Setup
@@ -134,6 +144,12 @@ class ConfigManager:
             "autoplay": False,
             "favorites_only": False,
             "auto_hide_controls": False,
+            "session": {
+                "server_ip": "",
+                "server_port": "8765",
+                "username": "",
+                "last_room_code": "",
+            },
             "keybinds": {
                 "play_random": "Space",
                 "play_pause": "P",
@@ -172,7 +188,7 @@ class ConfigManager:
             with open(self.config_file, 'w') as f:
                 json.dump(self.config, f, indent=4)
         except Exception as e:
-            print(f"Failed to save config: {e}")
+            logging.getLogger("rdm").warning(f"Failed to save config: {e}")
 
     def get(self, key):
         return self.config.get(key)
@@ -918,6 +934,842 @@ class StyledButton(QPushButton):
 
 
 # ============================================================================
+# Session Panel (Watch Together)
+# ============================================================================
+
+class SessionPanel(QFrame):
+    """Collapsible right-side panel for Watch Together session management."""
+
+    # Signal to safely pass test results from background thread to UI
+    _test_result_signal = pyqtSignal(bool, str)
+
+    def __init__(self, config_manager, parent=None):
+        super().__init__(parent)
+        self.config_manager = config_manager
+        self.session_client = None
+        self._player = parent  # Reference to VideoPlayer
+        self.setAcceptDrops(True)  # Enable drag & drop for video sharing
+
+        self.setFixedWidth(280)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_medium']};
+                border-left: 1px solid {COLORS['border']};
+            }}
+        """)
+
+        self._test_result_signal.connect(self._show_test_result)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # Header
+        header = QLabel("🎬  Watch Together")
+        header.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: bold; border: none;")
+        layout.addWidget(header)
+
+        # ---- Connection Section ----
+        self.connect_section = QWidget()
+        self.connect_section.setStyleSheet("border: none;")
+        conn_layout = QVBoxLayout(self.connect_section)
+        conn_layout.setContentsMargins(0, 0, 0, 0)
+        conn_layout.setSpacing(6)
+
+        # Server Address + Port
+        conn_layout.addWidget(self._make_label("Server Address"))
+        session_cfg = self.config_manager.get("session") or {}
+        
+        server_row = QHBoxLayout()
+        server_row.setSpacing(4)
+        self.server_ip_input = self._make_input(session_cfg.get("server_ip", ""), "IP / hostname")
+        self.server_port_input = self._make_input(session_cfg.get("server_port", "8765"), "Port")
+        self.server_port_input.setFixedWidth(60)
+        server_row.addWidget(self.server_ip_input, stretch=1)
+        colon_label = QLabel(":")
+        colon_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 14px; font-weight: bold; border: none;")
+        colon_label.setFixedWidth(8)
+        server_row.addWidget(colon_label)
+        server_row.addWidget(self.server_port_input)
+        conn_layout.addLayout(server_row)
+
+        # Test connection button
+        self.test_btn = QPushButton("Test Connection")
+        self.test_btn.setCursor(Qt.PointingHandCursor)
+        self.test_btn.setStyleSheet(self._btn_style())
+        self.test_btn.clicked.connect(self._test_connection)
+        conn_layout.addWidget(self.test_btn)
+
+        self.connection_status = QLabel("")
+        self.connection_status.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; border: none;")
+        self.connection_status.setWordWrap(True)
+        conn_layout.addWidget(self.connection_status)
+
+        conn_layout.addWidget(self._make_separator())
+
+        # Username
+        conn_layout.addWidget(self._make_label("Username"))
+        self.username_input = self._make_input(session_cfg.get("username", ""), "Your display name")
+        conn_layout.addWidget(self.username_input)
+
+        conn_layout.addWidget(self._make_separator())
+
+        # Create Room
+        conn_layout.addWidget(self._make_label("Create Room"))
+        self.create_pw_input = self._make_input("", "Room password", password=True)
+        conn_layout.addWidget(self.create_pw_input)
+        self.create_btn = QPushButton("🏠  Create Room")
+        self.create_btn.setCursor(Qt.PointingHandCursor)
+        self.create_btn.setStyleSheet(self._btn_style(COLORS['accent_green']))
+        self.create_btn.clicked.connect(self._create_room)
+        conn_layout.addWidget(self.create_btn)
+
+        conn_layout.addWidget(self._make_separator())
+
+        # Join Room
+        conn_layout.addWidget(self._make_label("Join Room"))
+        self.join_code_input = self._make_input(session_cfg.get("last_room_code", ""), "Room code")
+        conn_layout.addWidget(self.join_code_input)
+        self.join_pw_input = self._make_input("", "Room password", password=True)
+        conn_layout.addWidget(self.join_pw_input)
+        self.join_btn = QPushButton("🔗  Join Room")
+        self.join_btn.setCursor(Qt.PointingHandCursor)
+        self.join_btn.setStyleSheet(self._btn_style(COLORS['accent_blue']))
+        self.join_btn.clicked.connect(self._join_room)
+        conn_layout.addWidget(self.join_btn)
+
+        layout.addWidget(self.connect_section)
+
+        # ---- Active Session Section (hidden until connected) ----
+        self.session_section = QWidget()
+        self.session_section.setStyleSheet("border: none;")
+        self.session_section.setVisible(False)
+        sess_layout = QVBoxLayout(self.session_section)
+        sess_layout.setContentsMargins(0, 0, 0, 0)
+        sess_layout.setSpacing(6)
+
+        # Room info + copy button
+        room_row = QHBoxLayout()
+        room_row.setSpacing(4)
+        self.room_info_label = QLabel("")
+        self.room_info_label.setStyleSheet(f"color: {COLORS['accent_green']}; font-size: 12px; font-weight: bold; border: none;")
+        room_row.addWidget(self.room_info_label, stretch=1)
+
+        self.copy_code_btn = QPushButton("📋 Copy")
+        self.copy_code_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_code_btn.setFixedWidth(70)
+        self.copy_code_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 10px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['border']};
+                color: {COLORS['text_primary']};
+            }}
+        """)
+        self.copy_code_btn.clicked.connect(self._copy_room_code)
+        room_row.addWidget(self.copy_code_btn)
+        sess_layout.addLayout(room_row)
+
+        # Ping display
+        self.ping_label = QLabel("📶 Ping: —")
+        self.ping_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; border: none;")
+        sess_layout.addWidget(self.ping_label)
+
+        # Shared random pool toggle (host only)
+        from PyQt5.QtWidgets import QCheckBox
+        self.shared_pool_cb = QCheckBox("🎲 Shared random pool")
+        self.shared_pool_cb.setToolTip("When on, Random Clip picks from a random user's gallery")
+        self.shared_pool_cb.setStyleSheet(f"""
+            QCheckBox {{
+                color: {COLORS['text_secondary']};
+                font-size: 11px;
+                border: none;
+                spacing: 6px;
+            }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid {COLORS['border']};
+                border-radius: 3px;
+                background-color: {COLORS['bg_dark']};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {COLORS['accent_blue']};
+                border-color: {COLORS['accent_blue']};
+            }}
+        """)
+        self.shared_pool_cb.toggled.connect(self._on_shared_pool_toggled)
+        sess_layout.addWidget(self.shared_pool_cb)
+
+        sess_layout.addWidget(self._make_separator())
+
+        # Users list
+        sess_layout.addWidget(self._make_label("Connected Users"))
+        self.users_list = QListWidget()
+        self.users_list.setMaximumHeight(120)
+        self.users_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.users_list.customContextMenuRequested.connect(self._show_user_context_menu)
+        self.users_list.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {COLORS['bg_dark']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                color: {COLORS['text_primary']};
+                font-size: 11px;
+            }}
+            QListWidget::item {{ padding: 3px 6px; }}
+        """)
+        sess_layout.addWidget(self.users_list)
+
+        sess_layout.addWidget(self._make_separator())
+
+        # Activity feed
+        sess_layout.addWidget(self._make_label("Activity"))
+        self.activity_feed = QListWidget()
+        self.activity_feed.setMaximumHeight(100)
+        self.activity_feed.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.activity_feed.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.activity_feed.setSelectionMode(QListWidget.NoSelection)
+        self.activity_feed.setFocusPolicy(Qt.NoFocus)
+        self.activity_feed.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {COLORS['bg_dark']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                color: {COLORS['text_muted']};
+                font-size: 10px;
+            }}
+            QListWidget::item {{
+                padding: 2px 6px;
+                border: none;
+            }}
+        """)
+        sess_layout.addWidget(self.activity_feed)
+
+        sess_layout.addWidget(self._make_separator())
+
+        # Share clip button (also drop hint)
+        self.share_btn = QPushButton("📤  Share Current Clip")
+        self.share_btn.setCursor(Qt.PointingHandCursor)
+        self.share_btn.setStyleSheet(self._btn_style(COLORS['accent_orange']))
+        self.share_btn.clicked.connect(self._share_current_clip)
+        sess_layout.addWidget(self.share_btn)
+
+        # Drop hint
+        self.drop_hint = QLabel("📂  or drag && drop a video file here")
+        self.drop_hint.setAlignment(Qt.AlignCenter)
+        self.drop_hint.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 9px; border: none; font-style: italic;")
+        sess_layout.addWidget(self.drop_hint)
+
+        # Upload/download progress
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; border: none;")
+        self.progress_label.setWordWrap(True)
+        sess_layout.addWidget(self.progress_label)
+
+        sess_layout.addWidget(self._make_separator())
+
+        # Now playing
+        self.now_playing_label = QLabel("Nothing playing")
+        self.now_playing_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; border: none;")
+        self.now_playing_label.setWordWrap(True)
+        sess_layout.addWidget(self.now_playing_label)
+
+        sess_layout.addWidget(self._make_separator())
+
+        # Disconnect button
+        self.disconnect_btn = QPushButton("❌  Disconnect")
+        self.disconnect_btn.setCursor(Qt.PointingHandCursor)
+        self.disconnect_btn.setStyleSheet(self._btn_style(COLORS['accent_red']))
+        self.disconnect_btn.clicked.connect(self._disconnect)
+        sess_layout.addWidget(self.disconnect_btn)
+
+        sess_layout.addStretch()
+        layout.addWidget(self.session_section)
+
+        layout.addStretch()
+
+    # ---- Helpers ----
+
+    def _make_label(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; border: none;")
+        return lbl
+
+    def _make_input(self, value, placeholder, password=False):
+        from PyQt5.QtWidgets import QLineEdit
+        inp = QLineEdit(value)
+        inp.setPlaceholderText(placeholder)
+        if password:
+            inp.setEchoMode(QLineEdit.Password)
+        inp.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {COLORS['bg_dark']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 6px 8px;
+                font-size: 12px;
+            }}
+            QLineEdit:focus {{
+                border-color: {COLORS['accent_blue']};
+            }}
+        """)
+        return inp
+
+    def _make_separator(self):
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"background-color: {COLORS['border']}; border: none; max-height: 1px;")
+        return sep
+
+    # ---- Activity Feed ----
+
+    _VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.m4v', '.ts', '.mpg', '.mpeg'}
+
+    def add_activity(self, text):
+        """Add an entry to the activity feed (max 50 items, auto-scrolls)."""
+        if not hasattr(self, 'activity_feed'):
+            return
+        self.activity_feed.addItem(text)
+        while self.activity_feed.count() > 50:
+            self.activity_feed.takeItem(0)
+        self.activity_feed.scrollToBottom()
+
+    # ---- Drag & Drop ----
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    ext = os.path.splitext(url.toLocalFile())[1].lower()
+                    if ext in self._VIDEO_EXTENSIONS:
+                        event.acceptProposedAction()
+                        return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                filepath = url.toLocalFile()
+                ext = os.path.splitext(filepath)[1].lower()
+                if ext in self._VIDEO_EXTENSIONS:
+                    event.acceptProposedAction()
+                    self._share_dropped_file(filepath)
+                    return
+        event.ignore()
+
+    def _share_dropped_file(self, filepath):
+        """Upload a dropped video file to the session."""
+        if not self.session_client or not self.session_client.is_connected:
+            self.progress_label.setText("Not connected — can't share")
+            return
+        filename = os.path.basename(filepath)
+        self.progress_label.setText(f"⏳ Uploading {filename}...")
+        self.add_activity(f"📤 You shared {filename}")
+        self.session_client.upload_and_play(filepath)
+
+    def _btn_style(self, bg=None):
+        bg = bg or COLORS['bg_light']
+        return f"""
+            QPushButton {{
+                background-color: {bg};
+                color: {COLORS['text_primary']};
+                border: none;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{ opacity: 0.85; }}
+            QPushButton:pressed {{ opacity: 0.7; }}
+        """
+
+    # ---- Actions ----
+
+    def _save_session_config(self):
+        session_cfg = self.config_manager.get("session") or {}
+        session_cfg["server_ip"] = self.server_ip_input.text().strip()
+        session_cfg["server_port"] = self.server_port_input.text().strip() or "8765"
+        session_cfg["username"] = self.username_input.text().strip()
+        self.config_manager.set("session", session_cfg)
+
+    def _get_server_url(self):
+        """Build the full server URL from IP + Port fields."""
+        ip = self.server_ip_input.text().strip()
+        port = self.server_port_input.text().strip() or "8765"
+        if not ip:
+            return None
+        return f"{ip}:{port}"
+
+    def _test_connection(self):
+        if not SESSION_AVAILABLE:
+            self.connection_status.setText("❌ Session module not available (check dependencies)")
+            return
+        server = self._get_server_url()
+        if not server:
+            self.connection_status.setText("❌ Enter a server address")
+            return
+        self.connection_status.setText("⏳ Testing...")
+        self.connection_status.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; border: none;")
+        # Run test in background so UI doesn't freeze
+        import threading
+        def test():
+            client = SessionClient()
+            ok, msg = client.test_connection(server)
+            self._test_result_signal.emit(ok, msg)
+        threading.Thread(target=test, daemon=True).start()
+
+    def _show_test_result(self, ok, msg):
+        color = COLORS['accent_green'] if ok else COLORS['accent_red']
+        icon = "✅" if ok else "❌"
+        self.connection_status.setText(f"{icon} {msg}")
+        self.connection_status.setStyleSheet(f"color: {color}; font-size: 10px; border: none;")
+        if ok:
+            self._save_session_config()
+
+    def _create_room(self):
+        if not SESSION_AVAILABLE:
+            self.connection_status.setText("❌ Session module not available")
+            return
+        server = self._get_server_url()
+        username = self.username_input.text().strip()
+        password = self.create_pw_input.text()
+        if not server:
+            self.connection_status.setText("❌ Enter a server address")
+            return
+        if not username:
+            self.connection_status.setText("❌ Enter a username")
+            return
+        if not password or len(password) < 4:
+            self.connection_status.setText("❌ Password must be at least 4 characters")
+            return
+
+        self._save_session_config()
+        self.connection_status.setText("⏳ Creating room...")
+
+        self.session_client = SessionClient()
+        self._connect_signals()
+        self.session_client.create_room(server, username, password)
+
+    def _join_room(self):
+        if not SESSION_AVAILABLE:
+            self.connection_status.setText("❌ Session module not available")
+            return
+        server = self._get_server_url()
+        username = self.username_input.text().strip()
+        room_code = self.join_code_input.text().strip().upper()
+        password = self.join_pw_input.text()
+        if not server:
+            self.connection_status.setText("❌ Enter a server address")
+            return
+        if not username:
+            self.connection_status.setText("❌ Enter a username")
+            return
+        if not room_code:
+            self.connection_status.setText("❌ Enter a room code")
+            return
+        if not password:
+            self.connection_status.setText("❌ Enter the room password")
+            return
+
+        self._save_session_config()
+        session_cfg = self.config_manager.get("session") or {}
+        session_cfg["last_room_code"] = room_code
+        self.config_manager.set("session", session_cfg)
+
+        self.connection_status.setText("⏳ Joining room...")
+
+        self.session_client = SessionClient()
+        self._connect_signals()
+        self.session_client.join_room(server, username, room_code, password)
+
+    def _disconnect(self):
+        if self.session_client:
+            self.session_client.disconnect()
+        self._show_disconnected("Disconnected")
+
+    def _copy_room_code(self):
+        """Copy the room code to clipboard."""
+        if self.session_client and self.session_client.room_code:
+            QApplication.clipboard().setText(self.session_client.room_code)
+            self.copy_code_btn.setText("✅ Copied!")
+            QTimer.singleShot(1500, lambda: self.copy_code_btn.setText("📋 Copy"))
+
+    def _share_current_clip(self):
+        if not self.session_client or not self.session_client.is_connected:
+            self.progress_label.setText("Not connected")
+            return
+        player = self._player
+        if player and player.current_video and os.path.exists(player.current_video):
+            self.progress_label.setText("⏳ Uploading...")
+            self.session_client.upload_and_play(player.current_video)
+        else:
+            self.progress_label.setText("No clip loaded")
+
+    # ---- Signal Wiring ----
+
+    def _connect_signals(self):
+        c = self.session_client.signals
+        c.connected.connect(self._on_connected)
+        c.disconnected.connect(self._show_disconnected)
+        c.connection_error.connect(self._on_error)
+        c.room_created.connect(self._on_room_created)
+        c.room_joined.connect(self._on_room_joined)
+        c.room_error.connect(self._on_error)
+        c.user_joined.connect(self._on_user_joined)
+        c.user_left.connect(self._on_user_left)
+        c.user_kicked.connect(self._on_user_kicked)
+        c.kicked.connect(self._on_kicked)
+        c.upload_progress.connect(self._on_upload_progress)
+        c.download_progress.connect(self._on_download_progress)
+        c.video_uploaded.connect(self._on_video_uploaded)
+        c.video_ready.connect(self._on_video_ready)
+        c.ping_result.connect(self._on_ping_result)
+        c.sync_to_video.connect(self._on_sync_to_video)
+
+        # Ready-sync signals
+        c.prepare_video.connect(self._on_prepare_video)
+        c.all_ready.connect(self._on_all_ready)
+        c.ready_progress.connect(self._on_ready_progress)
+
+        # Shared pool: server asks us to provide a random clip
+        if self._player:
+            c.random_clip_requested.connect(self._player._on_random_clip_requested)
+        c.shared_pool_changed.connect(self._on_shared_pool_changed)
+
+        # Playback signals → forwarded to VideoPlayer (and logged in activity)
+        if self._player:
+            c.remote_play.connect(self._on_activity_play)
+            c.remote_pause.connect(self._on_activity_pause)
+            c.remote_seek.connect(self._on_activity_seek)
+            c.remote_speed.connect(self._on_activity_speed)
+            c.remote_play_video.connect(self._on_activity_play_video)
+
+    # ---- Handlers ----
+
+    def _on_activity_play(self, position, username):
+        self.add_activity(f"▶ {username} pressed play")
+        self._player._on_remote_play(position, username)
+
+    def _on_activity_pause(self, position, username):
+        self.add_activity(f"⏸ {username} paused")
+        self._player._on_remote_pause(position, username)
+
+    def _on_activity_seek(self, position, username):
+        self.add_activity(f"⏩ {username} seeked")
+        self._player._on_remote_seek(position, username)
+
+    def _on_activity_speed(self, speed, username):
+        self.add_activity(f"⚡ {username} set speed {speed}x")
+        self._player._on_remote_speed(speed, username)
+
+    def _on_activity_play_video(self, video_id, filename, username):
+        self.add_activity(f"🎬 {username} shared {filename}")
+        self._player._on_remote_play_video(video_id, filename, username)
+
+    def _on_connected(self):
+        self.connection_status.setText("✅ WebSocket connected")
+        self.connection_status.setStyleSheet(f"color: {COLORS['accent_green']}; font-size: 10px; border: none;")
+
+    def _on_room_created(self, room_code, user_id):
+        self.room_info_label.setText(f"Room: {room_code}")
+        self.connect_section.setVisible(False)
+        self.session_section.setVisible(True)
+        self.users_list.clear()
+        self.activity_feed.clear()
+        username = self.username_input.text().strip()
+        self.users_list.addItem(f"👑 {username} (you)")
+        self.add_activity(f"🏠 Room {room_code} created")
+        # Update connection dot
+        if self._player:
+            self._player._update_session_dot(True)
+
+    def _on_room_joined(self, data):
+        if isinstance(data, dict):
+            room_code = data.get("room_code", self.session_client.room_code or "")
+            users = data.get("users", [])
+        else:
+            room_code = self.session_client.room_code or ""
+            users = []
+        self.room_info_label.setText(f"Room: {room_code}")
+        self.connect_section.setVisible(False)
+        self.session_section.setVisible(True)
+        # Only clear activity if this is the first join (not a reconnect)
+        was_reconnect = self.activity_feed.count() > 0
+        self._update_users_list(users)
+        if was_reconnect:
+            self.add_activity("🔄 Reconnected")
+        else:
+            self.add_activity(f"🔗 Joined room {room_code}")
+        # Update connection dot
+        if self._player:
+            self._player._update_session_dot(True)
+
+    def _on_sync_to_video(self, video_id, filename, playback_state):
+        """Sync to the video currently playing when joining mid-session."""
+        self.add_activity(f"🔄 Syncing to: {filename}")
+        self.now_playing_label.setText(f"▶ {filename}")
+        self._pending_sync_state = playback_state  # Will be applied once video_ready fires
+        self._pending_sync_video_id = video_id
+
+    def _on_user_joined(self, username, users):
+        self._update_users_list(users)
+        self.add_activity(f"👋 {username} joined")
+        self.progress_label.setText(f"👋 {username} joined")
+        QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+
+    def _on_user_left(self, username, users):
+        self._update_users_list(users)
+        self.add_activity(f"👋 {username} left")
+        self.progress_label.setText(f"👋 {username} left")
+        QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+
+    def _on_user_kicked(self, username, kicked_by, users):
+        self._update_users_list(users)
+        self.add_activity(f"🚫 {username} was kicked by {kicked_by}")
+        self.progress_label.setText(f"🚫 {username} was kicked")
+        QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+
+    def _on_kicked(self, message):
+        """We were kicked from the room."""
+        self.add_activity(f"🚫 {message}")
+        self._show_disconnected(message)
+
+    def _update_users_list(self, users):
+        self.users_list.clear()
+        self._users_data = users  # Store for kick context menu
+        for u in users:
+            uid = u.get("user_id", "")
+            uname = u.get("username", "Unknown")
+            prefix = "👑 " if self.session_client and uid == self.session_client._host_id else ""
+            suffix = " (you)" if self.session_client and uid == self.session_client.user_id else ""
+            self.users_list.addItem(f"{prefix}{uname}{suffix}")
+
+    def _show_user_context_menu(self, pos):
+        """Right-click context menu on users list — host can kick."""
+        if not self.session_client or not self.session_client.is_host:
+            return
+        item = self.users_list.itemAt(pos)
+        if not item:
+            return
+        row = self.users_list.row(item)
+        if not hasattr(self, '_users_data') or row >= len(self._users_data):
+            return
+        user = self._users_data[row]
+        uid = user.get("user_id", "")
+        uname = user.get("username", "")
+        # Can't kick yourself
+        if uid == self.session_client.user_id:
+            return
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+            }}
+            QMenu::item {{ padding: 6px 24px; }}
+            QMenu::item:selected {{ background-color: {COLORS['accent_red']}; }}
+        """)
+        kick_action = menu.addAction(f"🚫 Kick {uname}")
+        action = menu.exec_(self.users_list.viewport().mapToGlobal(pos))
+        if action == kick_action:
+            self.session_client.send_kick(uid)
+            self.add_activity(f"🚫 You kicked {uname}")
+
+    def _on_error(self, msg):
+        self.connection_status.setText(f"❌ {msg}")
+        self.connection_status.setStyleSheet(f"color: {COLORS['accent_red']}; font-size: 10px; border: none;")
+        # Clear uploading flag on error so user can try again
+        if self._player:
+            self._player._session_uploading = False
+
+    def _show_disconnected(self, reason=""):
+        self.connect_section.setVisible(True)
+        self.session_section.setVisible(False)
+        self.connection_status.setText(f"Disconnected: {reason}" if reason else "Disconnected")
+        self.connection_status.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; border: none;")
+        self.session_client = None
+        self.shared_pool_cb.setChecked(False)
+        # Update connection dot and reset shared pool
+        if self._player:
+            self._player._update_session_dot(False)
+            self._player._session_shared_pool = False
+            self._player._session_uploading = False
+
+    def _on_upload_progress(self, sent, total):
+        if total > 0:
+            pct = int(sent / total * 100)
+            self.progress_label.setText(f"⬆ Uploading: {pct}% ({sent // 1024}KB / {total // 1024}KB)")
+
+    def _on_download_progress(self, recv, total):
+        if total > 0:
+            pct = int(recv / total * 100)
+            self.progress_label.setText(f"⬇ Downloading: {pct}%")
+        else:
+            self.progress_label.setText(f"⬇ Downloading: {recv // 1024}KB")
+
+    def _on_video_uploaded(self, video_id, filename, size, uploader):
+        self.progress_label.setText(f"📤 {uploader} shared: {filename}")
+        QTimer.singleShot(5000, lambda: self.progress_label.setText(""))
+
+    def _on_video_ready(self, video_id, local_path):
+        self.progress_label.setText("✅ Video ready")
+        self.now_playing_label.setText(f"▶ {os.path.basename(local_path)}")
+
+        # If this was a join-in-progress sync, play immediately with sync state
+        pending_id = getattr(self, '_pending_sync_video_id', None)
+        if pending_id == video_id:
+            if self._player:
+                self._player._play_session_video(video_id, local_path)
+                sync_state = getattr(self, '_pending_sync_state', {})
+                position = sync_state.get('position', 0.0)
+                speed = sync_state.get('speed', 1.0)
+                is_playing = sync_state.get('playing', False)
+                def _apply_sync():
+                    self._player._ignore_remote = True
+                    if position > 0.01:
+                        self._player.player.set_position(position)
+                    if speed != 1.0:
+                        self._player.player.set_rate(speed)
+                        self._player.slow_mo_btn.set_speed(speed)
+                    if not is_playing:
+                        self._player.player.pause()
+                        self._player.play_btn.setText("▶  Play")
+                    self._player._ignore_remote = False
+                    self.add_activity("🔄 Synced to position")
+                QTimer.singleShot(500, _apply_sync)
+            self._pending_sync_video_id = None
+            self._pending_sync_state = {}
+            QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+            return
+
+        # Ready-sync (non-host): load video, pause, report ready, wait for all_ready
+        pending_prepare = getattr(self, '_pending_prepare_video_id', None)
+        if pending_prepare == video_id:
+            if self._player:
+                self._player._load_session_video(local_path)
+                QTimer.singleShot(200, lambda: self._pause_and_report_ready(video_id))
+            self._pending_prepare_video_id = None
+            QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+            return
+
+        # Host uploaded this clip — load, pause, wait for all_ready
+        if self.session_client and self.session_client.is_connected:
+            if self._player:
+                self._player._load_session_video(local_path)
+                QTimer.singleShot(200, lambda: self._host_wait_for_ready(video_id))
+            QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+            return
+
+        # Fallback: not in a session, just play
+        if self._player:
+            self._player._play_session_video(video_id, local_path)
+        QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+
+    def _host_wait_for_ready(self, video_id):
+        """Host uploaded a clip — pause and wait for all users to be ready."""
+        if self._player:
+            self._player._ignore_remote = True
+            self._player.player.pause()
+            self._player.play_btn.setText("▶  Play")
+            self._player._ignore_remote = False
+        self.progress_label.setText("⏳ Waiting for everyone to download...")
+
+    def _pause_and_report_ready(self, video_id):
+        """Pause video and tell server we're ready."""
+        if self._player:
+            self._player._ignore_remote = True
+            self._player.player.pause()
+            self._player.play_btn.setText("▶  Play")
+            self._player._ignore_remote = False
+        self.progress_label.setText("⏳ Waiting for everyone...")
+        if self.session_client and self.session_client.is_connected:
+            self.session_client.send_ready(video_id)
+
+    def _on_prepare_video(self, video_id, filename, username):
+        """Server says a new video is coming — download it and wait."""
+        self._pending_prepare_video_id = video_id
+        self.add_activity(f"🎬 {username} shared {filename}")
+        self.now_playing_label.setText(f"▶ {filename}")
+        self.progress_label.setText(f"⬇ Downloading from {username}...")
+
+    def _on_all_ready(self, video_id):
+        """Everyone is ready — start playback from the beginning."""
+        self.add_activity("✅ All synced — playing!")
+        self.progress_label.setText("▶ Playing!")
+        QTimer.singleShot(2000, lambda: self.progress_label.setText(""))
+        if self._player:
+            self._player._session_uploading = False
+            self._player._playing_remote_clip = True  # Don't re-share when this clip ends
+            self._player._ignore_remote = True
+            self._player.player.set_position(0.0)
+            self._player.player.play()
+            self._player.play_btn.setText("⏸  Pause")
+            self._player.timer.start()
+            self._player._apply_current_speed()
+            self._player._ignore_remote = False
+
+    def _on_ready_progress(self, ready_count, total):
+        """Show how many users are ready."""
+        self.progress_label.setText(f"⏳ Syncing: {ready_count}/{total} ready")
+
+    def _on_ping_result(self, latency_ms):
+        """Update ping display with color-coded latency."""
+        if latency_ms < 80:
+            color = COLORS['accent_green']
+            icon = "📶"
+        elif latency_ms < 200:
+            color = COLORS['accent_orange']
+            icon = "📶"
+        else:
+            color = COLORS['accent_red']
+            icon = "📶"
+        self.ping_label.setText(f"{icon} Ping: {latency_ms}ms")
+        self.ping_label.setStyleSheet(f"color: {color}; font-size: 10px; border: none;")
+
+    def _on_shared_pool_toggled(self, checked):
+        """Host toggled the shared random pool."""
+        if self.session_client and self.session_client.is_connected:
+            self.session_client.send_set_shared_pool(checked)
+        if self._player:
+            self._player._session_shared_pool = checked
+        self.add_activity(f"🎲 Shared pool {'ON' if checked else 'OFF'}")
+
+    def _on_shared_pool_changed(self, enabled, changed_by):
+        """Another user (host) toggled the shared pool."""
+        self.shared_pool_cb.blockSignals(True)
+        self.shared_pool_cb.setChecked(enabled)
+        self.shared_pool_cb.blockSignals(False)
+        if self._player:
+            self._player._session_shared_pool = enabled
+        self.add_activity(f"🎲 {changed_by} {'enabled' if enabled else 'disabled'} shared pool")
+
+    def cleanup(self):
+        if self.session_client:
+            self.session_client.cleanup()
+
+
+# ============================================================================
 # Main Application
 # ============================================================================
 
@@ -926,7 +1778,7 @@ class VideoPlayer(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Random Clip Player v3.0")
+        self.setWindowTitle("Random Clip Player v4.0")
         self.setGeometry(100, 100, 1100, 700)
         self.setMinimumSize(800, 550)
         
@@ -955,6 +1807,14 @@ class VideoPlayer(QMainWindow):
         self.is_slider_pressed = False
         self._last_volume = self.config_manager.get("volume")
         self._cached_fps = 0  # Cache FPS to avoid repeated VLC calls
+        
+        # Session (Watch Together) state
+        self._session_active = False
+        self._ignore_remote = False  # Prevent echo loops
+        self._session_panel = None
+        self._session_shared_pool = False  # Shared random pool mode
+        self._playing_remote_clip = False  # True when current clip came from another user
+        self._session_uploading = False    # True while uploading a clip to session
         
         # Setup UI
         self._setup_ui()
@@ -1055,6 +1915,19 @@ class VideoPlayer(QMainWindow):
         settings_action.setShortcut("Ctrl+,")
         settings_action.triggered.connect(self.show_settings_dialog)
         settings_menu.addAction(settings_action)
+        
+        # Session Menu (Watch Together)
+        if SESSION_AVAILABLE:
+            self._session_dot = "⚫"  # Disconnected
+            self._session_menu_label = f"{self._session_dot} Session"
+            session_menu = navbar.addMenu(self._session_menu_label)
+            self._session_menu = session_menu
+
+            self.toggle_session_action = QAction("Toggle Session Panel", self)
+            self.toggle_session_action.setShortcut("Ctrl+T")
+            self.toggle_session_action.setCheckable(True)
+            self.toggle_session_action.triggered.connect(self._toggle_session_panel)
+            session_menu.addAction(self.toggle_session_action)
 
     def show_settings_dialog(self):
         """Show the settings dialog"""
@@ -1100,7 +1973,14 @@ class VideoPlayer(QMainWindow):
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         
-        main_layout = QVBoxLayout(central_widget)
+        # Top-level horizontal layout: [main content | session panel]
+        top_layout = QHBoxLayout(central_widget)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(0)
+        
+        # Main content container
+        main_container = QWidget()
+        main_layout = QVBoxLayout(main_container)
         main_layout.setContentsMargins(12, 10, 12, 10)
         main_layout.setSpacing(6)
         
@@ -1296,6 +2176,15 @@ class VideoPlayer(QMainWindow):
         
         # Set initial volume
         self.player.audio_set_volume(self._last_volume)
+        
+        # Add main content to top layout
+        top_layout.addWidget(main_container, stretch=1)
+        
+        # Session panel (hidden by default)
+        if SESSION_AVAILABLE:
+            self._session_panel = SessionPanel(self.config_manager, self)
+            self._session_panel.setVisible(False)
+            top_layout.addWidget(self._session_panel)
 
     def _apply_global_styles(self):
         """Apply global application styles"""
@@ -1449,8 +2338,11 @@ class VideoPlayer(QMainWindow):
         self.prev_clip_btn.setEnabled(self.queue_index > 0)
         
         has_video = bool(self.current_video)
-        self.block_btn.setEnabled(has_video)
-        self.like_btn.setEnabled(has_video)
+        in_session = self._get_session_client() is not None
+
+        # Disable like/dislike in session mode (remote clips can't be favorited)
+        self.block_btn.setEnabled(has_video and not in_session)
+        self.like_btn.setEnabled(has_video and not in_session)
         
         # Update Like button visual state (green when liked)
         if has_video and self.current_video in self.liked_clips:
@@ -1488,10 +2380,25 @@ class VideoPlayer(QMainWindow):
 
     def play_random_clip(self):
         """Play next random clip from shuffled queue"""
+        # Block if we're already uploading a clip to the session
+        if self._session_uploading:
+            self.status_label.setText("⏳ Upload in progress...")
+            return
+
+        self._playing_remote_clip = False
+
+        client = self._get_session_client()
+        if DEBUG_MODE:
+            logging.getLogger("rdm").debug(f"play_random_clip: queue_len={len(self.play_queue)}, idx={self.queue_index}, shared_pool={self._session_shared_pool}, in_session={client is not None}")
+
+        # In session with shared pool: ask server to pick a random user
+        if client and self._session_shared_pool:
+            client.send_request_random()
+            self.status_label.setText("🎲 Requesting random clip from pool...")
+            return
+
         if not self.play_queue:
-            # Try to refresh if empty (maybe files were added or blocks removed)
             self._refresh_queue()
-            
             if not self.play_queue:
                 self.video_label.setText("⚠  No playable clips found (check blocked list)")
                 self.video_label.setStyleSheet(f"color: {COLORS['accent_orange']}; font-size: 13px; padding: 6px 4px;")
@@ -1499,23 +2406,47 @@ class VideoPlayer(QMainWindow):
 
         # Advance index
         self.queue_index += 1
-        
-        # If we reached the end, reshuffle and start over
         if self.queue_index >= len(self.play_queue):
             self.video_label.setText("🔄  All clips played! Reshuffling...")
             random.shuffle(self.play_queue)
             self.queue_index = 0
-            
+
         self.current_video = self.play_queue[self.queue_index]
         self._update_navigation_state()
+
+        # In session mode: DON'T play locally — upload first, wait for all_ready
+        if client:
+            filename = os.path.basename(self.current_video)
+            self.video_label.setText(f"⏳ Uploading: {filename}")
+            self.video_label.setStyleSheet(f"color: {COLORS['accent_orange']}; font-size: 13px; padding: 6px 4px;")
+            self.status_label.setText("⏳ Syncing with session...")
+            self._session_auto_share()
+            return
+
+        # Not in session — play locally immediately
         self._play_video(self.current_video)
 
     def play_previous_clip(self):
         """Navigate to the previous clip in queue"""
+        if self._session_uploading:
+            self.status_label.setText("⏳ Upload in progress...")
+            return
+        self._playing_remote_clip = False
         if self.queue_index > 0:
             self.queue_index -= 1
             self.current_video = self.play_queue[self.queue_index]
             self._update_navigation_state()
+
+            # In session mode: upload first, don't play locally
+            client = self._get_session_client()
+            if client:
+                filename = os.path.basename(self.current_video)
+                self.video_label.setText(f"⏳ Uploading: {filename}")
+                self.status_label.setText("⏳ Syncing with session...")
+                self._session_auto_share()
+                return
+
+            # Not in session — play locally
             self._play_video(self.current_video)
 
     def toggle_autoplay(self):
@@ -1557,7 +2488,7 @@ class VideoPlayer(QMainWindow):
                 )
             except Exception as e:
                 self.status_label.setText("⚠ Failed to open explorer")
-                print(f"Explorer error: {e}")
+                logging.getLogger("rdm").warning(f"Explorer error: {e}")
 
     def toggle_like(self):
         """Toggle like status for current clip"""
@@ -1617,6 +2548,8 @@ class VideoPlayer(QMainWindow):
 
     def _play_video(self, filepath):
         """Play a specific video file"""
+        if DEBUG_MODE:
+            logging.getLogger("rdm").debug(f"_play_video: {filepath}")
         media = self.instance.media_new(filepath)
         self.player.set_media(media)
         
@@ -1655,14 +2588,17 @@ class VideoPlayer(QMainWindow):
             self.timer.start()
             if self.slow_mo_btn.isChecked():
                 self.player.set_rate(0.5)
+            self._session_send_play()
         elif self.player.is_playing():
             self.player.pause()
             self.play_btn.setText("▶  Play")
+            self._session_send_pause()
         else:
             self.player.play()
             self.play_btn.setText("⏸  Pause")
             self.timer.start()
             self._apply_current_speed()
+            self._session_send_play()
 
     def _toggle_slow_motion(self):
         """Toggle between 0.5x and 1.0x speed"""
@@ -1683,6 +2619,7 @@ class VideoPlayer(QMainWindow):
         self.player.set_rate(speed)
         self.status_label.setText(f"Speed: {speed}x")
         QTimer.singleShot(1500, self._update_status_bar)
+        self._session_send_speed(speed)
         
     def _apply_current_speed(self):
         """Apply the current speed setting from the button"""
@@ -1744,6 +2681,7 @@ class VideoPlayer(QMainWindow):
     def _set_position(self, position):
         """Set video position from slider"""
         self.player.set_position(position / 1000.0)
+        self._session_send_seek(position / 1000.0)
 
     def _slider_pressed(self):
         """Handle slider press"""
@@ -1800,7 +2738,15 @@ class VideoPlayer(QMainWindow):
         state = self.player.get_state()
         if state == vlc.State.Ended:
             if self.autoplay_enabled:
-                QTimer.singleShot(50, self.play_random_clip)
+                # In a session, only the host triggers autoplay
+                client = self._get_session_client()
+                if client and not client.is_host:
+                    # Non-host: just stop, wait for host's next clip
+                    self.timer.stop()
+                    self.play_btn.setText("▶  Play")
+                    self.status_label.setText("⏳ Waiting for host...")
+                else:
+                    QTimer.singleShot(50, self.play_random_clip)
             else:
                 self.timer.stop()
                 self.play_btn.setText("▶  Play")
@@ -1904,12 +2850,184 @@ class VideoPlayer(QMainWindow):
             self._controls_animation.finished.connect(lambda: self.controls_container.setVisible(False) if self.auto_hide_controls else None)
             self._controls_animation.start()
 
+    # ========================================================================
+    # Session (Watch Together) Integration
+    # ========================================================================
+
+    def _toggle_session_panel(self):
+        """Show/hide the session panel."""
+        if self._session_panel:
+            visible = not self._session_panel.isVisible()
+            self._session_panel.setVisible(visible)
+            self._session_active = visible
+            if hasattr(self, 'toggle_session_action'):
+                self.toggle_session_action.setChecked(visible)
+
+    def _session_auto_share(self):
+        """Upload + share the current clip to the session."""
+        client = self._get_session_client()
+        if client and self.current_video and os.path.exists(self.current_video):
+            self._session_uploading = True
+            if DEBUG_MODE:
+                logging.getLogger("rdm").debug(f"Auto-sharing: {self.current_video}")
+            if self._session_panel:
+                self._session_panel.progress_label.setText("⏳ Sharing clip...")
+                self._session_panel.add_activity(f"📤 You shared {os.path.basename(self.current_video)}")
+            client.upload_and_play(self.current_video)
+
+    def _on_random_clip_requested(self):
+        """Server picked us to provide a random clip for the shared pool."""
+        if not self.play_queue:
+            self._refresh_queue()
+        if not self.play_queue:
+            self.status_label.setText("⚠ No clips to share")
+            return
+        # Pick a random clip and share it (don't play locally — wait for all_ready)
+        self.queue_index += 1
+        if self.queue_index >= len(self.play_queue):
+            random.shuffle(self.play_queue)
+            self.queue_index = 0
+        self.current_video = self.play_queue[self.queue_index]
+        self._update_navigation_state()
+        filename = os.path.basename(self.current_video)
+        self.video_label.setText(f"⏳ Uploading: {filename}")
+        self.status_label.setText("⏳ Syncing with session...")
+        self._session_auto_share()
+
+    def _update_session_dot(self, connected):
+        """Update the session menu title with a green/grey dot."""
+        if not hasattr(self, '_session_menu'):
+            return
+        dot = "🟢" if connected else "⚫"
+        self._session_menu.setTitle(f"{dot} Session")
+
+    def _get_session_client(self):
+        """Get the active session client, or None."""
+        if self._session_panel and self._session_panel.session_client:
+            client = self._session_panel.session_client
+            if client.is_connected:
+                return client
+        return None
+
+    def _session_send_play(self):
+        """Notify the session that we pressed play."""
+        if self._ignore_remote:
+            return
+        client = self._get_session_client()
+        if client:
+            pos = self.player.get_position() or 0.0
+            client.send_play(pos)
+
+    def _session_send_pause(self):
+        """Notify the session that we pressed pause."""
+        if self._ignore_remote:
+            return
+        client = self._get_session_client()
+        if client:
+            pos = self.player.get_position() or 0.0
+            client.send_pause(pos)
+
+    def _session_send_seek(self, position):
+        """Notify the session that we seeked."""
+        if self._ignore_remote:
+            return
+        client = self._get_session_client()
+        if client:
+            client.send_seek(position)
+
+    def _session_send_speed(self, speed):
+        """Notify the session of speed change."""
+        if self._ignore_remote:
+            return
+        client = self._get_session_client()
+        if client:
+            client.send_speed(speed)
+
+    # ---- Remote event handlers (called by SessionPanel signals) ----
+
+    def _on_remote_play(self, position, username):
+        """Another user pressed play."""
+        if DEBUG_MODE:
+            logging.getLogger("rdm").debug(f"Remote PLAY from {username} at pos={position:.4f}")
+        self._ignore_remote = True
+        self.player.set_position(position)
+        if not self.player.is_playing():
+            self.player.play()
+            self.timer.start()
+            self.play_btn.setText("⏸  Pause")
+            self._apply_current_speed()
+        self.status_label.setText(f"▶ {username} pressed play")
+        QTimer.singleShot(2000, self._update_status_bar)
+        self._ignore_remote = False
+
+    def _on_remote_pause(self, position, username):
+        """Another user pressed pause."""
+        self._ignore_remote = True
+        if self.player.is_playing():
+            self.player.pause()
+            self.play_btn.setText("▶  Play")
+        self.player.set_position(position)
+        self.status_label.setText(f"⏸ {username} paused")
+        QTimer.singleShot(2000, self._update_status_bar)
+        self._ignore_remote = False
+
+    def _on_remote_seek(self, position, username):
+        """Another user seeked."""
+        self._ignore_remote = True
+        self.player.set_position(position)
+        self.status_label.setText(f"⏩ {username} seeked")
+        QTimer.singleShot(2000, self._update_status_bar)
+        self._ignore_remote = False
+
+    def _on_remote_speed(self, speed, username):
+        """Another user changed speed."""
+        self._ignore_remote = True
+        self.player.set_rate(speed)
+        self.slow_mo_btn.set_speed(speed)
+        self.status_label.setText(f"Speed: {speed}x by {username}")
+        QTimer.singleShot(2000, self._update_status_bar)
+        self._ignore_remote = False
+
+    def _on_remote_play_video(self, video_id, filename, username):
+        """Another user wants to play a video — download it."""
+        if DEBUG_MODE:
+            logging.getLogger("rdm").debug(f"Remote PLAY_VIDEO from {username}: {filename} (id={video_id})")
+        self.status_label.setText(f"📥 {username} is sharing: {filename}")
+        client = self._get_session_client()
+        if client:
+            # Check if we already have it locally
+            local = client.get_local_video_path(video_id)
+            if local:
+                self._play_session_video(video_id, local)
+            # Otherwise download_video was already triggered by session_client
+
+    def _play_session_video(self, video_id, local_path):
+        """Play a session video that has been downloaded locally."""
+        if os.path.exists(local_path):
+            self._ignore_remote = True
+            self._playing_remote_clip = True  # Don't re-share when this clip ends
+            self.current_video = local_path
+            self._play_video(local_path)
+            self._ignore_remote = False
+
+    def _load_session_video(self, local_path):
+        """Load a session video into the player but don't start playback.
+        Used for ready-sync: load the video, pause, then wait for all_ready."""
+        if os.path.exists(local_path):
+            self._ignore_remote = True
+            self.current_video = local_path
+            self._play_video(local_path)
+            self._ignore_remote = False
+
     def closeEvent(self, event):
         """Clean up on window close"""
         self.timer.stop()
         self.hide_controls_timer.stop()
         if hasattr(self, '_controls_animation'):
             self._controls_animation.stop()
+        # Clean up session
+        if self._session_panel:
+            self._session_panel.cleanup()
         self.player.stop()
         self.player.release()
         self.instance.release()
@@ -1917,10 +3035,47 @@ class VideoPlayer(QMainWindow):
 
 
 # ============================================================================
+# Debug Mode
+# ============================================================================
+
+DEBUG_MODE = False
+
+def _setup_debug():
+    """Configure verbose logging and exception hooks for debug mode."""
+    global DEBUG_MODE
+    DEBUG_MODE = True
+
+    # Verbose logging to console
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    log = logging.getLogger("rdm")
+    log.info("Debug mode enabled")
+
+    # Also crank up session_client logging
+    logging.getLogger("rdm-session").setLevel(logging.DEBUG)
+
+    # Global exception hook — print to console instead of silently crashing
+    def _exception_hook(exc_type, exc_value, exc_tb):
+        log.critical("Unhandled exception:", exc_info=(exc_type, exc_value, exc_tb))
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+    sys.excepthook = _exception_hook
+
+
+# ============================================================================
 # Application Entry Point
 # ============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Random Clip Player")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode (verbose logging, console output)")
+    args = parser.parse_args()
+
+    if args.debug:
+        _setup_debug()
+
     # Enable high DPI scaling for crisp UI on 4K displays
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
@@ -1934,6 +3089,14 @@ def main():
     app.setFont(font)
     
     player = VideoPlayer()
+
+    # Debug overlay: show a small label in the title bar
+    if DEBUG_MODE:
+        player.setWindowTitle("Random Clip Player v4.0 [DEBUG]")
+        logging.getLogger("rdm").info(f"VLC version: {vlc.libvlc_get_version()}")
+        logging.getLogger("rdm").info(f"Python: {sys.version}")
+        logging.getLogger("rdm").info(f"Session module: {'available' if SESSION_AVAILABLE else 'NOT available'}")
+
     player.show()
     
     sys.exit(app.exec_())

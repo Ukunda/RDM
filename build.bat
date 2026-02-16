@@ -14,11 +14,12 @@ if errorlevel 1 (
 )
 
 echo [1/3] Installing required packages...
-pip install PyQt5 python-vlc pyinstaller
+pip install PyQt5 python-vlc requests websocket-client pyinstaller
 
 echo.
 echo [2/3] Creating executable...
-pyinstaller --onefile --windowed --name "RandomClipPlayer" --icon=NONE random_clip_player.py
+REM --windowed hides the console in release builds. Debug mode (--debug) is CLI-only.
+pyinstaller --onefile --windowed --name "RandomClipPlayer" --icon=NONE --hidden-import=session_client random_clip_player.py
 
 echo.
 echo [3/3] Build complete!

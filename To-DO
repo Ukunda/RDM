@@ -1,0 +1,10 @@
+✅ Add options to change keybinds via menu 
+✅ frame by frame skip via . and , button ( changeable via keybind)
+✅ toggle option for the "button bar" part of the ui to "move" out of view if the coursor isnt hovering over it. 
+✅ toggle in the dropdownmenu to "show only favorites" 
+✅ settings menu next to the file menu 
+✅ when scrolling over the slomo button change slow amount. if button is pressed it defaults to 0.5 
+
+✅ current button layout is good and should be kept but add option for user to drag buttons around to rearange them. size of the buttons should remain the same 
+
+✅ Big update: "Watch Together" function — session rooms with room codes, password protection, full playback sync (play/pause/seek/speed), clip upload & streaming, shared random pool, ready-sync protocol, host-only autoplay, auto-reconnect, sync-on-join, ping display, host kick, activity feed, connection status dot, debug mode (--debug). Server deployed via Docker.
