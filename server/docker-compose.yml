@@ -1,0 +1,19 @@
+services:
+  rdm-server:
+    build: .
+    container_name: rdm-watch-together
+    ports:
+      - "${RDM_PORT:-8765}:${RDM_PORT:-8765}"
+    volumes:
+      - rdm_uploads:/app/uploads
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${RDM_PORT:-8765}/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  rdm_uploads:

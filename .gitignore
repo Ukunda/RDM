@@ -14,5 +14,10 @@ dist/
 # Virtual Environments
 venv/
 env/
+.venv/
 
 config.json
+
+# Server
+server/.env
+server/uploads/
