@@ -1,0 +1,46 @@
+# Refactoring Random Clip Player
+
+The [random_clip_player.py](file:///c:/Hobby/RDM/random_clip_player.py) file has grown to over 3,100 lines. To safely untangle this monolith and improve maintainability, we will execute a phased, incremental refactoring strategy. This avoids the risks of a big-bang refactor by ensuring we have tests and proper interfaces in place before moving code.
+
+## User Review Required
+
+> [!NOTE]
+> This plan has been revised to focus on safety, testing, and incremental steps per your feedback. Let me know if you would like me to begin Phase 1 (Smoke Tests), or if we should focus on finishing any remaining v4.5 bugfixes first!
+
+## Phase 1: Basic Smoke Tests
+Before moving any code, we must establish a baseline of test coverage to ensure we don't break existing functionality during extraction.
+- **[NEW] `tests/test_config.py`**: Test that [ConfigManager](file:///c:/Hobby/RDM/random_clip_player.py#135-207) successfully round-trips configurations (reading, writing, default values).
+- **[NEW] `tests/test_session_client.py`**: Test that [SessionClient](file:///c:/Hobby/RDM/session_client.py#83-773) can initialize, connect, and disconnect properly.
+- **[NEW] `tests/test_video_player.py`**: Test that [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077) initializes without crashing and tear-down works.
+
+## Phase 2: Constants & Interfaces Preparation
+We need to untangle shared state and tightly coupled components before they can be moved into separate files.
+
+### Shared State Isolation
+- **[NEW] `rdm/constants.py`**: Move global/shared constants here so they aren't scattered across modules. Will include:
+  - `COLORS` (used across all UI classes)
+  - `VIDEO_EXTENSIONS` (used in VideoPlayer and upload logic)
+  - `DEBUG_MODE`
+
+### Interface Definitions
+- **[MODIFY] `SessionPanel` & [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077)**: `SessionPanel` currently holds a direct reference to [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077) (`self._player`) and calls its private methods directly. 
+  - We will define a proper signal-only contract (e.g., `PlayerSignals`) so `SessionPanel` communicates with [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077) through Qt signals rather than direct method calls.
+
+## Phase 3: Incremental Refactoring
+Once tests are passing and interfaces are clean, we will extract one class at a time into the `rdm/` package. Each extraction will be verified against the smoke tests.
+
+1. **[ConfigManager](file:///c:/Hobby/RDM/random_clip_player.py#135-207)** -> `rdm/config.py`
+2. **[BlockedListDialog](file:///c:/Hobby/RDM/random_clip_player.py#208-295)** -> `rdm/ui/blocked_list_dialog.py`
+3. **[SettingsDialog](file:///c:/Hobby/RDM/random_clip_player.py#356-560) & [KeybindButton](file:///c:/Hobby/RDM/random_clip_player.py#297-354)** -> `rdm/ui/settings_dialog.py`
+4. **`SessionPanel`** -> `rdm/ui/session_panel.py` (after signal contract is established)
+5. **UI Components**: Instead of a catch-all file, we'll extract them purposefully:
+   - `rdm/ui/controls.py`: `DraggableWidget`, `DraggableButtonBar`
+   - UI elements tightly coupled to [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077) (like `SpeedButton` and `ClickableSlider`) may initially remain with it until a clearer separation point emerges.
+6. **[SessionClient](file:///c:/Hobby/RDM/session_client.py#83-773)** -> `rdm/session_client.py` (ensuring `PyInstaller` hooks are updated)
+7. **[VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077)** -> `rdm/app.py`
+8. **Root Entry Point** -> `main.py`
+
+## PyInstaller Build Updates
+As we extract modules, we must update [RandomClipPlayer.spec](file:///c:/Hobby/RDM/RandomClipPlayer.spec) incrementally to ensure PyInstaller correctly bundles the new package structure.
+- Update `hiddenimports` to explicitly include `rdm.*` submodules instead of the old `session_client` path.
+- Keep the [random_clip_player.py](file:///c:/Hobby/RDM/random_clip_player.py) monolith functional for building until the new structure is fully verified.

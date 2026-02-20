@@ -1,6 +1,6 @@
 """
 Random Clip Player - A polished video clip player with random playback
-Version 4.0 - Watch Together
+Version 4.5 - Bugfix & Stability
 """
 
 import sys
@@ -1808,7 +1808,7 @@ class VideoPlayer(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Random Clip Player v4.0")
+        self.setWindowTitle("Random Clip Player v4.5")
         self.setGeometry(100, 100, 1100, 700)
         self.setMinimumSize(800, 550)
         
@@ -3134,7 +3134,7 @@ def main():
 
     # Debug overlay: show a small label in the title bar
     if DEBUG_MODE:
-        player.setWindowTitle("Random Clip Player v4.0 [DEBUG]")
+        player.setWindowTitle("Random Clip Player v4.5 [DEBUG]")
         logging.getLogger("rdm").info(f"VLC version: {vlc.libvlc_get_version()}")
         logging.getLogger("rdm").info(f"Python: {sys.version}")
         logging.getLogger("rdm").info(f"Session module: {'available' if SESSION_AVAILABLE else 'NOT available'}")
