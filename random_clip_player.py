@@ -171,6 +171,9 @@ class ConfigManager:
             }
         }
         self.config = self.load_config()
+        self._save_timer = QTimer()
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self._do_save)
 
     def load_config(self):
         """Load config from JSON file or return defaults"""
@@ -183,7 +186,11 @@ class ConfigManager:
         return self.default_config.copy()
 
     def save_config(self):
-        """Save current config to JSON file"""
+        """Debounce save requests"""
+        self._save_timer.start(500)  # 500ms debounce
+
+    def _do_save(self):
+        """Actually save current config to JSON file"""
         try:
             with open(self.config_file, 'w') as f:
                 json.dump(self.config, f, indent=4)

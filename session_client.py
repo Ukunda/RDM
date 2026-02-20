@@ -12,6 +12,7 @@ import time
 import threading
 import tempfile
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -215,6 +216,18 @@ class SessionClient:
         self._room_code = None
         self._user_id = None
         self._videos.clear()
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up temporary downloaded files."""
+        try:
+            if self._download_dir.exists():
+                shutil.rmtree(self._download_dir, ignore_errors=True)
+        except Exception as e:
+            log.error(f"Failed to clean up temp dir: {e}")
+
+    def __del__(self):
+        self.cleanup()
 
     # ====================================================================
     # Send Playback Events
