@@ -156,13 +156,13 @@ class ServerState:
         attempts = self.join_attempts.setdefault(ip, [])
         attempts.append(time.time())
 
-    def delete_room(self, room_code: str):
+    async def delete_room(self, room_code: str):
         """Delete a room and clean up its files."""
         if room_code in self.rooms:
             del self.rooms[room_code]
         room_dir = UPLOAD_DIR / room_code
         if room_dir.exists():
-            shutil.rmtree(room_dir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, room_dir, ignore_errors=True)
         log.info(f"Room deleted: {room_code}")
 
     async def cleanup_expired(self):
@@ -176,9 +176,21 @@ class ServerState:
                     await user.websocket.close(1000, "Room expired")
                 except Exception:
                     pass
-            self.delete_room(code)
+            await self.delete_room(code)
         if expired:
             log.info(f"Cleaned up {len(expired)} expired room(s)")
+            
+        # Clean up old join attempts
+        now = time.time()
+        stale_ips = []
+        for ip, attempts in self.join_attempts.items():
+            valid_attempts = [t for t in attempts if now - t < JOIN_LOCKOUT_SECONDS]
+            if valid_attempts:
+                self.join_attempts[ip] = valid_attempts
+            else:
+                stale_ips.append(ip)
+        for ip in stale_ips:
+            del self.join_attempts[ip]
 
 
 state = ServerState()
@@ -316,17 +328,23 @@ async def upload_video(
     total_size = 0
     chunk_size = 1024 * 256  # 256KB chunks
 
-    async with aiofiles.open(filepath, "wb") as f:
-        while True:
-            chunk = await file.read(chunk_size)
-            if not chunk:
-                break
-            total_size += len(chunk)
-            if total_size > MAX_FILE_SIZE:
-                await f.close()
-                filepath.unlink(missing_ok=True)
-                raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)")
-            await f.write(chunk)
+    try:
+        async with aiofiles.open(filepath, "wb") as f:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_FILE_SIZE:
+                    await f.close()
+                    filepath.unlink(missing_ok=True)
+                    raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)")
+                await f.write(chunk)
+    except Exception as e:
+        filepath.unlink(missing_ok=True)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(500, "Upload failed")
 
     # Store metadata
     room.videos[video_id] = {
