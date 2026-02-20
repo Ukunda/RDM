@@ -44,3 +44,35 @@ Once tests are passing and interfaces are clean, we will extract one class at a 
 As we extract modules, we must update [RandomClipPlayer.spec](file:///c:/Hobby/RDM/RandomClipPlayer.spec) incrementally to ensure PyInstaller correctly bundles the new package structure.
 - Update `hiddenimports` to explicitly include `rdm.*` submodules instead of the old `session_client` path.
 - Keep the [random_clip_player.py](file:///c:/Hobby/RDM/random_clip_player.py) monolith functional for building until the new structure is fully verified.
+
+---
+
+## Copilot Review Notes
+
+> **Status:** v4.5 shipped. This plan is approved for post-release execution with the caveats below.
+
+### Strengths
+- Phased approach with tests-first is correct and avoids the big-bang risk.
+- `rdm/constants.py` for shared state solves cross-module dependency cleanly.
+- Signal-only contract between `SessionPanel` and `VideoPlayer` is the right decoupling pattern.
+- Keeping the monolith alive during migration provides a rollback path.
+- Purposeful UI component splitting (not a catch-all) is pragmatic.
+
+### Open Issues to Address Before Starting
+
+1. **Circular import prevention.** Once `rdm/app.py` imports from `rdm/ui/session_panel.py` and `session_panel.py` needs types/signals defined near `VideoPlayer`, circular imports will occur. All shared types and the `PlayerSignals` class should live in `rdm/constants.py` or a dedicated `rdm/signals.py` to break cycles. This needs explicit planning before Phase 3 step 4.
+
+2. **`setup_vlc()` placement.** This function runs at module level *before* `import vlc` and does PATH manipulation on Windows. It must be the very first thing that executes. It should go in `rdm/utils.py` and be called from `main.py` before any other `rdm` imports touch VLC. Document this ordering constraint.
+
+3. **Phase 1 tooling.** `ConfigManager` is a pure unit test. But `VideoPlayer` init requires `QApplication` + VLC — use `pytest-qt` with a `qapp` fixture. `SessionClient` connect/disconnect needs either a mock server or `unittest.mock.patch` on `websocket.WebSocketApp`. Classify which tests are unit vs. integration upfront so expectations are clear.
+
+4. **Phase 2 should be split.** Constants extraction (2a) is trivial and low-risk. The signal interface refactor (2b) is substantially harder — `SessionPanel` calls ~10 private methods on `VideoPlayer` via `self._player`. Converting these to signals requires defining signal signatures, wiring them in `VideoPlayer.__init__`, and verifying the async timing still works. These deserve separate commits.
+
+5. **Phase 3 steps 7-8 are highest risk.** Extracting `VideoPlayer` into `rdm/app.py` is where all import chains converge. Flag this as a verification checkpoint — run smoke tests AND a PyInstaller build before and after.
+
+### Future Technology Migration (post-refactor)
+
+The refactor makes it feasible to later migrate the tech stack:
+- **PyQt5 → PySide6**: Mostly mechanical (`from PyQt5` → `from PySide6`, enum style changes). PySide6 has proper type stubs, LGPL license, and active Qt6 development. PyQt5/Qt5 is effectively EOL.
+- **python-vlc → mpv or Qt6 Multimedia**: VLC requires a system install, has no type stubs, and is a 40MB+ runtime dependency. `python-mpv` is a lighter drop-in; `PySide6 QMediaPlayer` eliminates external dependencies entirely. Either swap becomes straightforward once playback is isolated in `rdm/app.py`.
+- **Execution order**: Refactor structure first (this plan), then PyQt5→PySide6, then VLC replacement. Never combine structural and technology migrations.
