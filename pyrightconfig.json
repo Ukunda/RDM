@@ -1,0 +1,8 @@
+{
+    "typeCheckingMode": "basic",
+    "reportAttributeAccessIssue": "none",
+    "reportIncompatibleMethodOverride": "none",
+    "reportOptionalMemberAccess": "warning",
+    "reportPossiblyUnbound": "warning",
+    "reportArgumentType": "warning"
+}

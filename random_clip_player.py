@@ -26,6 +26,7 @@ try:
     from session_client import SessionClient
     SESSION_AVAILABLE = True
 except ImportError:
+    SessionClient = None  # type: ignore[assignment,misc]
     SESSION_AVAILABLE = False
 
 # ============================================================================
@@ -673,9 +674,9 @@ class DraggableButtonBar(QWidget):
         super().__init__(parent)
         self.config_manager = config_manager
         self.widget_map = {}  # widget_id -> DraggableWidget
-        self.layout = QHBoxLayout(self)
-        self.layout.setSpacing(self.BUTTON_SPACING)
-        self.layout.setContentsMargins(0, 4, 0, 0)
+        self._layout = QHBoxLayout(self)
+        self._layout.setSpacing(self.BUTTON_SPACING)
+        self._layout.setContentsMargins(0, 4, 0, 0)
         self.setAcceptDrops(True)
         self._rearrange_mode = False
         
@@ -696,15 +697,15 @@ class DraggableButtonBar(QWidget):
         """Add a widget with an ID for persistence"""
         draggable = DraggableWidget(widget, widget_id, self)
         self.widget_map[widget_id] = draggable
-        self.layout.addWidget(draggable, stretch)
+        self._layout.addWidget(draggable, stretch)
         
     def add_spacing(self, size):
         """Add spacing to layout"""
-        self.layout.addSpacing(size)
+        self._layout.addSpacing(size)
         
     def add_fixed_widget(self, widget, stretch=0):
         """Add a non-draggable widget"""
-        self.layout.addWidget(widget, stretch)
+        self._layout.addWidget(widget, stretch)
         
     def swap_widgets(self, source_id, target_id):
         """Swap two widgets in the layout"""
@@ -714,21 +715,21 @@ class DraggableButtonBar(QWidget):
         source = self.widget_map[source_id]
         target = self.widget_map[target_id]
         
-        source_idx = self.layout.indexOf(source)
-        target_idx = self.layout.indexOf(target)
+        source_idx = self._layout.indexOf(source)
+        target_idx = self._layout.indexOf(target)
         
         if source_idx >= 0 and target_idx >= 0:
             # Remove both
-            self.layout.removeWidget(source)
-            self.layout.removeWidget(target)
+            self._layout.removeWidget(source)
+            self._layout.removeWidget(target)
             
             # Re-insert in swapped positions
             if source_idx < target_idx:
-                self.layout.insertWidget(source_idx, target)
-                self.layout.insertWidget(target_idx, source)
+                self._layout.insertWidget(source_idx, target)
+                self._layout.insertWidget(target_idx, source)
             else:
-                self.layout.insertWidget(target_idx, source)
-                self.layout.insertWidget(source_idx, target)
+                self._layout.insertWidget(target_idx, source)
+                self._layout.insertWidget(source_idx, target)
                 
             # Save order
             self._save_order()
@@ -736,10 +737,11 @@ class DraggableButtonBar(QWidget):
     def _save_order(self):
         """Save current widget order to config"""
         order = []
-        for i in range(self.layout.count()):
-            item = self.layout.itemAt(i)
-            if item.widget() and isinstance(item.widget(), DraggableWidget):
-                order.append(item.widget().widget_id)
+        for i in range(self._layout.count()):
+            item = self._layout.itemAt(i)
+            w = item.widget() if item else None
+            if w is not None and isinstance(w, DraggableWidget):
+                order.append(w.widget_id)
         self.config_manager.set("button_order", order)
         
     def restore_order(self, order):
@@ -750,13 +752,13 @@ class DraggableButtonBar(QWidget):
         # Get current positions
         widgets_by_id = {}
         for widget_id, draggable in self.widget_map.items():
-            idx = self.layout.indexOf(draggable)
+            idx = self._layout.indexOf(draggable)
             if idx >= 0:
                 widgets_by_id[widget_id] = (draggable, idx)
         
         # Temporarily remove all draggable widgets
         for widget_id, (draggable, _) in widgets_by_id.items():
-            self.layout.removeWidget(draggable)
+            self._layout.removeWidget(draggable)
             
         # Re-add in order, then remaining ones
         added = set()
@@ -764,14 +766,14 @@ class DraggableButtonBar(QWidget):
         for widget_id in order:
             if widget_id in widgets_by_id:
                 draggable, _ = widgets_by_id[widget_id]
-                self.layout.insertWidget(insert_pos, draggable)
+                self._layout.insertWidget(insert_pos, draggable)
                 added.add(widget_id)
                 insert_pos += 1
                 
         # Add any that weren't in the saved order
         for widget_id, (draggable, _) in widgets_by_id.items():
             if widget_id not in added:
-                self.layout.insertWidget(insert_pos, draggable)
+                self._layout.insertWidget(insert_pos, draggable)
                 insert_pos += 1
 
 
@@ -780,11 +782,10 @@ class SpeedButton(QPushButton):
     
     SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     
-    speed_changed = None  # Will be connected in VideoPlayer
-    
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self.current_speed = 1.0
+        self.speed_changed = None  # Callback set by VideoPlayer
         self.setMinimumHeight(36)
         self.setCursor(Qt.PointingHandCursor)
         self._apply_style()
@@ -1339,6 +1340,9 @@ class SessionPanel(QFrame):
         # Run test in background so UI doesn't freeze
         import threading
         def test():
+            if SessionClient is None:
+                self._test_result_signal.emit(False, "Session module not available")
+                return
             client = SessionClient()
             ok, msg = client.test_connection(server)
             self._test_result_signal.emit(ok, msg)
@@ -1372,6 +1376,9 @@ class SessionPanel(QFrame):
         self._save_session_config()
         self.connection_status.setText("⏳ Creating room...")
 
+        if SessionClient is None:
+            self.connection_status.setText("❌ Session module not available")
+            return
         self.session_client = SessionClient()
         self._connect_signals()
         self.session_client.create_room(server, username, password)
@@ -1404,6 +1411,9 @@ class SessionPanel(QFrame):
 
         self.connection_status.setText("⏳ Joining room...")
 
+        if SessionClient is None:
+            self.connection_status.setText("❌ Session module not available")
+            return
         self.session_client = SessionClient()
         self._connect_signals()
         self.session_client.join_room(server, username, room_code, password)
@@ -1416,9 +1426,12 @@ class SessionPanel(QFrame):
     def _copy_room_code(self):
         """Copy the room code to clipboard."""
         if self.session_client and self.session_client.room_code:
-            QApplication.clipboard().setText(self.session_client.room_code)
+            clipboard = QApplication.clipboard()
+            if clipboard:
+                clipboard.setText(self.session_client.room_code)
             self.copy_code_btn.setText("✅ Copied!")
-            QTimer.singleShot(1500, lambda: self.copy_code_btn.setText("📋 Copy"))
+            copy_btn = self.copy_code_btn
+            QTimer.singleShot(1500, lambda: copy_btn.setText("📋 Copy"))
 
     def _share_current_clip(self):
         if not self.session_client or not self.session_client.is_connected:
@@ -1434,6 +1447,7 @@ class SessionPanel(QFrame):
     # ---- Signal Wiring ----
 
     def _connect_signals(self):
+        assert self.session_client is not None
         c = self.session_client.signals
         c.connected.connect(self._on_connected)
         c.disconnected.connect(self._show_disconnected)
@@ -1474,23 +1488,28 @@ class SessionPanel(QFrame):
 
     def _on_activity_play(self, position, username):
         self.add_activity(f"▶ {username} pressed play")
-        self._player._on_remote_play(position, username)
+        if self._player:
+            self._player._on_remote_play(position, username)
 
     def _on_activity_pause(self, position, username):
         self.add_activity(f"⏸ {username} paused")
-        self._player._on_remote_pause(position, username)
+        if self._player:
+            self._player._on_remote_pause(position, username)
 
     def _on_activity_seek(self, position, username):
         self.add_activity(f"⏩ {username} seeked")
-        self._player._on_remote_seek(position, username)
+        if self._player:
+            self._player._on_remote_seek(position, username)
 
     def _on_activity_speed(self, speed, username):
         self.add_activity(f"⚡ {username} set speed {speed}x")
-        self._player._on_remote_speed(speed, username)
+        if self._player:
+            self._player._on_remote_speed(speed, username)
 
     def _on_activity_play_video(self, video_id, filename, username):
         self.add_activity(f"🎬 {username} shared {filename}")
-        self._player._on_remote_play_video(video_id, filename, username)
+        if self._player:
+            self._player._on_remote_play_video(video_id, filename, username)
 
     def _on_connected(self):
         self.connection_status.setText("✅ WebSocket connected")
@@ -1511,10 +1530,10 @@ class SessionPanel(QFrame):
 
     def _on_room_joined(self, data):
         if isinstance(data, dict):
-            room_code = data.get("room_code", self.session_client.room_code or "")
+            room_code = data.get("room_code", (self.session_client.room_code if self.session_client else "") or "")
             users = data.get("users", [])
         else:
-            room_code = self.session_client.room_code or ""
+            room_code = (self.session_client.room_code if self.session_client else "") or ""
             users = []
         self.room_info_label.setText(f"Room: {room_code}")
         self.connect_section.setVisible(False)
@@ -1598,7 +1617,9 @@ class SessionPanel(QFrame):
             QMenu::item:selected {{ background-color: {COLORS['accent_red']}; }}
         """)
         kick_action = menu.addAction(f"🚫 Kick {uname}")
-        action = menu.exec_(self.users_list.viewport().mapToGlobal(pos))
+        viewport = self.users_list.viewport()
+        assert viewport is not None
+        action = menu.exec_(viewport.mapToGlobal(pos))
         if action == kick_action:
             self.session_client.send_kick(uid)
             self.add_activity(f"🚫 You kicked {uname}")
@@ -1653,6 +1674,8 @@ class SessionPanel(QFrame):
                 speed = sync_state.get('speed', 1.0)
                 is_playing = sync_state.get('playing', False)
                 def _apply_sync():
+                    if not self._player:
+                        return
                     self._player._ignore_remote = True
                     if position > 0.01:
                         self._player.player.set_position(position)
@@ -1794,6 +1817,7 @@ class VideoPlayer(QMainWindow):
         
         # VLC instance and player
         self.instance = vlc.Instance('--no-xlib')
+        assert self.instance is not None, "Failed to create VLC instance"
         self.player = self.instance.media_player_new()
         
         # Folder path from config
@@ -1850,11 +1874,14 @@ class VideoPlayer(QMainWindow):
         
         # Enable mouse tracking for auto-hide
         self.setMouseTracking(True)
-        self.centralWidget().setMouseTracking(True)
+        cw = self.centralWidget()
+        if cw:
+            cw.setMouseTracking(True)
 
     def _create_menu_bar(self):
         """Create the application menu bar"""
         navbar = self.menuBar()
+        assert navbar is not None
         navbar.setStyleSheet(f"""
             QMenuBar {{
                 background-color: {COLORS['bg_medium']};
@@ -1883,6 +1910,7 @@ class VideoPlayer(QMainWindow):
         
         # File Menu
         file_menu = navbar.addMenu("File")
+        assert file_menu is not None
         
         open_action = QAction("Open Folder...", self)
         open_action.setShortcut("Ctrl+O")
@@ -1912,11 +1940,12 @@ class VideoPlayer(QMainWindow):
         
         exit_action = QAction("Exit", self)
         exit_action.setShortcut("Ctrl+Q")
-        exit_action.triggered.connect(self.close)
+        exit_action.triggered.connect(lambda: (self.close(), None)[-1])
         file_menu.addAction(exit_action)
         
         # Settings Menu
         settings_menu = navbar.addMenu("Settings")
+        assert settings_menu is not None
         
         settings_action = QAction("Preferences...", self)
         settings_action.setShortcut("Ctrl+,")
@@ -1928,6 +1957,7 @@ class VideoPlayer(QMainWindow):
             self._session_dot = "⚫"  # Disconnected
             self._session_menu_label = f"{self._session_dot} Session"
             session_menu = navbar.addMenu(self._session_menu_label)
+            assert session_menu is not None
             self._session_menu = session_menu
 
             self.toggle_session_action = QAction("Toggle Session Panel", self)
@@ -2123,7 +2153,7 @@ class VideoPlayer(QMainWindow):
         self.autoplay_btn = StyledButton("Auto", 'toggle')
         self.autoplay_btn.setMinimumSize(50, 36)
         self.autoplay_btn.setCheckable(True)
-        self.autoplay_btn.setChecked(self.autoplay_enabled)
+        self.autoplay_btn.setChecked(bool(self.autoplay_enabled))
         self.autoplay_btn.clicked.connect(self.toggle_autoplay)
         self.autoplay_btn.setToolTip("Autoplay (A)")
         self.button_bar.add_widget(self.autoplay_btn, "autoplay", stretch=1)
@@ -2157,7 +2187,7 @@ class VideoPlayer(QMainWindow):
         
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(self._last_volume)
+        self.volume_slider.setValue(int(self._last_volume or 80))
         self.volume_slider.setMinimumWidth(50)
         self.volume_slider.setMaximumWidth(80)
         self.volume_slider.valueChanged.connect(self._set_volume)
@@ -2182,7 +2212,7 @@ class VideoPlayer(QMainWindow):
         main_layout.addWidget(self.controls_container)
         
         # Set initial volume
-        self.player.audio_set_volume(self._last_volume)
+        self.player.audio_set_volume(int(self._last_volume or 80))
         
         # Add main content to top layout
         top_layout.addWidget(main_container, stretch=1)
@@ -2557,6 +2587,7 @@ class VideoPlayer(QMainWindow):
         """Play a specific video file"""
         if DEBUG_MODE:
             logging.getLogger("rdm").debug(f"_play_video: {filepath}")
+        assert self.instance is not None
         media = self.instance.media_new(filepath)
         self.player.set_media(media)
         
@@ -2723,7 +2754,7 @@ class VideoPlayer(QMainWindow):
             self._last_volume = self.volume_slider.value()
             self.volume_slider.setValue(0)
         else:
-            self.volume_slider.setValue(self._last_volume)
+            self.volume_slider.setValue(int(self._last_volume or 80))
 
     # ========================================================================
     # UI Updates
@@ -2818,7 +2849,10 @@ class VideoPlayer(QMainWindow):
         if hasattr(self, 'video_frame'):
             video_rect = self.video_frame.geometry()
             # Map to parent coordinates
-            video_global = self.video_frame.parent().mapToParent(video_rect.topLeft())
+            parent = self.video_frame.parent()
+            if parent is None:
+                return True
+            video_global = parent.mapToParent(video_rect.topLeft())
             video_rect.moveTopLeft(video_global)
             return video_rect.contains(pos)
         return True
@@ -2903,7 +2937,7 @@ class VideoPlayer(QMainWindow):
 
     def _update_session_dot(self, connected):
         """Update the session menu title with a green/grey dot."""
-        if not hasattr(self, '_session_menu'):
+        if not hasattr(self, '_session_menu') or self._session_menu is None:
             return
         dot = "🟢" if connected else "⚫"
         self._session_menu.setTitle(f"{dot} Session")
@@ -3037,7 +3071,8 @@ class VideoPlayer(QMainWindow):
             self._session_panel.cleanup()
         self.player.stop()
         self.player.release()
-        self.instance.release()
+        if self.instance:
+            self.instance.release()
         event.accept()
 
 
