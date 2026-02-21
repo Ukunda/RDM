@@ -1,78 +1,52 @@
-# Refactoring Random Clip Player
+# Upgrading Random Clip Player: Tech Stack & State Machine
 
-The [random_clip_player.py](file:///c:/Hobby/RDM/random_clip_player.py) file has grown to over 3,100 lines. To safely untangle this monolith and improve maintainability, we will execute a phased, incremental refactoring strategy. This avoids the risks of a big-bang refactor by ensuring we have tests and proper interfaces in place before moving code.
+This plan focuses on high-value technology upgrades (PySide6, MPV) and resolving fragile state management in the Watch Together client. We will execute these changes incrementally in separate branches to isolate risk.
 
 ## User Review Required
 
 > [!NOTE]
-> This plan has been revised to focus on safety, testing, and incremental steps per your feedback. Let me know if you would like me to begin Phase 1 (Smoke Tests), or if we should focus on finishing any remaining v4.5 bugfixes first!
+> Thank you for the detailed review! I've updated the plan to match your recommended execution order, dropped the low-value high-complexity items (Nuitka, metadata caching), and added concrete strategies for the MPV DLL and Qt embedding gotchas. Let me know if you approve this final version to start the PySide6 migration!
 
-## Phase 1: Basic Smoke Tests
-Before moving any code, we must establish a baseline of test coverage to ensure we don't break existing functionality during extraction.
-- **[NEW] `tests/test_config.py`**: Test that [ConfigManager](file:///c:/Hobby/RDM/random_clip_player.py#135-207) successfully round-trips configurations (reading, writing, default values).
-- **[NEW] `tests/test_session_client.py`**: Test that [SessionClient](file:///c:/Hobby/RDM/session_client.py#83-773) can initialize, connect, and disconnect properly.
-- **[NEW] `tests/test_video_player.py`**: Test that [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077) initializes without crashing and tear-down works.
+## Execution Strategy
 
-## Phase 2: Constants & Interfaces Preparation
-We need to untangle shared state and tightly coupled components before they can be moved into separate files.
+Each phase will be executed, verified, and committed independently on its own branch. 
 
-### Shared State Isolation
-- **[NEW] `rdm/constants.py`**: Move global/shared constants here so they aren't scattered across modules. Will include:
-  - `COLORS` (used across all UI classes)
-  - `VIDEO_EXTENSIONS` (used in VideoPlayer and upload logic)
-  - `DEBUG_MODE`
+### Phase 1: PySide6 Migration
+*Status: Mechanical, low risk, high value (fixes type stubs, better licensing).*
+- **[MODIFY] [random_clip_player.py](file:///c:/Hobby/RDM/random_clip_player.py), [session_client.py](file:///c:/Hobby/RDM/session_client.py):**
+  - Update imports: `PyQt5` -> `PySide6`.
+  - Update Enums: Fix namespace changes (e.g., `Qt.LeftButton` -> `Qt.MouseButton.LeftButton`, `Qt.Key_Space` -> `Qt.Key.Key_Space`).
+  - Update Signals/Slots: `pyqtSignal` -> [Signal](file:///c:/Hobby/RDM/session_client.py#31-77) (must remain at class level), `pyqtSlot` -> `Slot`.
+  - Application Execution: Change `app.exec_()` to `app.exec()`.
+- **[MODIFY] [requirements.txt](file:///c:/Hobby/RDM/requirements.txt) / Build:** Replace `PyQt5` with `PySide6`. Verify PyInstaller builds correctly.
 
-### Interface Definitions
-- **[MODIFY] `SessionPanel` & [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077)**: `SessionPanel` currently holds a direct reference to [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077) (`self._player`) and calls its private methods directly. 
-  - We will define a proper signal-only contract (e.g., `PlayerSignals`) so `SessionPanel` communicates with [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077) through Qt signals rather than direct method calls.
+### Phase 2: MPV Integration
+*Status: High risk, high reward. Requires replacing the entire playback layer.*
+- **Step 1: MPV DLL Strategy**
+  - Download a prebuilt `mpv-1.dll` (e.g., from shinchiro builds) and place it in a `lib/` directory in the repository.
+  - Update [build.bat](file:///c:/Hobby/RDM/build.bat) and [RandomClipPlayer.spec](file:///c:/Hobby/RDM/RandomClipPlayer.spec) to explicitly bundle `lib/mpv-1.dll` via `--add-data`.
+- **Step 2: Engine Replacement ([random_clip_player.py](file:///c:/Hobby/RDM/random_clip_player.py))**
+  - Remove [setup_vlc()](file:///c:/Hobby/RDM/random_clip_player.py#36-89) and `python-vlc` dependency.
+  - Add `python-mpv` to [requirements.txt](file:///c:/Hobby/RDM/requirements.txt).
+  - Initialize the engine: `mpv.MPV(wid=int(self.video_frame.winId()), vo='gpu', hwdec='auto')`.
+- **Step 3: Playback API Mapping & Threading**
+  - Rewrite core logic ([_play_video](file:///c:/Hobby/RDM/random_clip_player.py#2586-2617), [_toggle_play_pause](file:///c:/Hobby/RDM/random_clip_player.py#2618-2640), [_stop](file:///c:/Hobby/RDM/random_clip_player.py#2667-2676), frame stepping).
+  - Update speed control: Set `--af=scaletempo2` for seamless pitch correction when adjusting speed.
+  - **Threading Constraint:** MPV runs its event loop on a separate thread. `mpv.observe_property` callbacks (e.g., for time updates or window resizes) *must not* directly call Qt GUI methods. Callbacks must emit custom Qt [Signal](file:///c:/Hobby/RDM/session_client.py#31-77)s to route data safely back to the main GUI thread.
+- **Fallback Strategy (QMediaPlayer):**
+  - If `python-mpv` integration proves unviable on Windows due to OpenGL/compositor conflicts or packaging issues, we will pivot to Qt6's native `QMediaPlayer` (`PySide6.QtMultimedia`) as the official fallback engine. It provides the same core benefits (FFmpeg-backed, no external VLC installation required) with zero embedding friction.
 
-## Phase 3: Incremental Refactoring
-Once tests are passing and interfaces are clean, we will extract one class at a time into the `rdm/` package. Each extraction will be verified against the smoke tests.
+### Phase 3: Formal State Machine
+*Status: Medium effort, significantly improves robustness of Watch Together.*
+- **[NEW/MODIFY] [session_client.py](file:///c:/Hobby/RDM/session_client.py) / `SessionPanel`:**
+  - Define an explicit `enum.Enum` (e.g., `SessionState`: `DISCONNECTED`, `CONNECTING`, `LOBBY`, `DOWNLOADING_SYNC`, `WAITING_FOR_HOST`, `PLAYING`).
+  - Replace the scattered boolean flags (`_ignore_remote`, `_session_uploading`, `_playing_remote_clip`, `_pending_sync_video_id`).
+  - Route all websocket events and UI actions through a central state handler to prevent impossible state combinations (e.g., trying to play while downloading).
 
-1. **[ConfigManager](file:///c:/Hobby/RDM/random_clip_player.py#135-207)** -> `rdm/config.py`
-2. **[BlockedListDialog](file:///c:/Hobby/RDM/random_clip_player.py#208-295)** -> `rdm/ui/blocked_list_dialog.py`
-3. **[SettingsDialog](file:///c:/Hobby/RDM/random_clip_player.py#356-560) & [KeybindButton](file:///c:/Hobby/RDM/random_clip_player.py#297-354)** -> `rdm/ui/settings_dialog.py`
-4. **`SessionPanel`** -> `rdm/ui/session_panel.py` (after signal contract is established)
-5. **UI Components**: Instead of a catch-all file, we'll extract them purposefully:
-   - `rdm/ui/controls.py`: `DraggableWidget`, `DraggableButtonBar`
-   - UI elements tightly coupled to [VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077) (like `SpeedButton` and `ClickableSlider`) may initially remain with it until a clearer separation point emerges.
-6. **[SessionClient](file:///c:/Hobby/RDM/session_client.py#83-773)** -> `rdm/session_client.py` (ensuring `PyInstaller` hooks are updated)
-7. **[VideoPlayer](file:///c:/Hobby/RDM/random_clip_player.py#1806-3077)** -> `rdm/app.py`
-8. **Root Entry Point** -> `main.py`
-
-## PyInstaller Build Updates
-As we extract modules, we must update [RandomClipPlayer.spec](file:///c:/Hobby/RDM/RandomClipPlayer.spec) incrementally to ensure PyInstaller correctly bundles the new package structure.
-- Update `hiddenimports` to explicitly include `rdm.*` submodules instead of the old `session_client` path.
-- Keep the [random_clip_player.py](file:///c:/Hobby/RDM/random_clip_player.py) monolith functional for building until the new structure is fully verified.
+### Phase 4: QThread Migration (Optional Polish)
+*Status: Low priority.*
+- **[MODIFY] [session_client.py](file:///c:/Hobby/RDM/session_client.py):**
+  - If time permits, migrate the native `threading.Thread` usage ([_upload_thread](file:///c:/Hobby/RDM/session_client.py#648-715), [_download_thread](file:///c:/Hobby/RDM/session_client.py#716-755)) to PySide6 `QThread` or `QRunnable` for idiom consistency.
 
 ---
-
-## Copilot Review Notes
-
-> **Status:** v4.5 shipped. This plan is approved for post-release execution with the caveats below.
-
-### Strengths
-- Phased approach with tests-first is correct and avoids the big-bang risk.
-- `rdm/constants.py` for shared state solves cross-module dependency cleanly.
-- Signal-only contract between `SessionPanel` and `VideoPlayer` is the right decoupling pattern.
-- Keeping the monolith alive during migration provides a rollback path.
-- Purposeful UI component splitting (not a catch-all) is pragmatic.
-
-### Open Issues to Address Before Starting
-
-1. **Circular import prevention.** Once `rdm/app.py` imports from `rdm/ui/session_panel.py` and `session_panel.py` needs types/signals defined near `VideoPlayer`, circular imports will occur. All shared types and the `PlayerSignals` class should live in `rdm/constants.py` or a dedicated `rdm/signals.py` to break cycles. This needs explicit planning before Phase 3 step 4.
-
-2. **`setup_vlc()` placement.** This function runs at module level *before* `import vlc` and does PATH manipulation on Windows. It must be the very first thing that executes. It should go in `rdm/utils.py` and be called from `main.py` before any other `rdm` imports touch VLC. Document this ordering constraint.
-
-3. **Phase 1 tooling.** `ConfigManager` is a pure unit test. But `VideoPlayer` init requires `QApplication` + VLC — use `pytest-qt` with a `qapp` fixture. `SessionClient` connect/disconnect needs either a mock server or `unittest.mock.patch` on `websocket.WebSocketApp`. Classify which tests are unit vs. integration upfront so expectations are clear.
-
-4. **Phase 2 should be split.** Constants extraction (2a) is trivial and low-risk. The signal interface refactor (2b) is substantially harder — `SessionPanel` calls ~10 private methods on `VideoPlayer` via `self._player`. Converting these to signals requires defining signal signatures, wiring them in `VideoPlayer.__init__`, and verifying the async timing still works. These deserve separate commits.
-
-5. **Phase 3 steps 7-8 are highest risk.** Extracting `VideoPlayer` into `rdm/app.py` is where all import chains converge. Flag this as a verification checkpoint — run smoke tests AND a PyInstaller build before and after.
-
-### Future Technology Migration (post-refactor)
-
-The refactor makes it feasible to later migrate the tech stack:
-- **PyQt5 → PySide6**: Mostly mechanical (`from PyQt5` → `from PySide6`, enum style changes). PySide6 has proper type stubs, LGPL license, and active Qt6 development. PyQt5/Qt5 is effectively EOL.
-- **python-vlc → mpv or Qt6 Multimedia**: VLC requires a system install, has no type stubs, and is a 40MB+ runtime dependency. `python-mpv` is a lighter drop-in; `PySide6 QMediaPlayer` eliminates external dependencies entirely. Either swap becomes straightforward once playback is isolated in `rdm/app.py`.
-- **Execution order**: Refactor structure first (this plan), then PyQt5→PySide6, then VLC replacement. Never combine structural and technology migrations.
+*(Items dropped from previous plans: Nuitka, Metadata Caching, HLS Transcoding, Server Persistence)*
