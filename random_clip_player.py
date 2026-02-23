@@ -12,14 +12,14 @@ import argparse
 import logging
 import traceback
 from pathlib import Path
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QPushButton, QSlider, QLabel, QFrame, QSizePolicy, QShortcut,
-    QFileDialog, QAction, QMessageBox, QDialog, QListWidget, QListWidgetItem,
+    QPushButton, QSlider, QLabel, QFrame, QSizePolicy,
+    QFileDialog, QMessageBox, QDialog, QListWidget, QListWidgetItem,
     QScrollArea
 )
-from PyQt5.QtCore import Qt, QTimer, QMimeData, QPoint, QPropertyAnimation, QEasingCurve, pyqtSignal
-from PyQt5.QtGui import QFont, QKeySequence, QIcon, QDrag, QPixmap, QPainter
+from PySide6.QtCore import Qt, QTimer, QMimeData, QPoint, QPropertyAnimation, QEasingCurve, Signal, QObject, QEvent
+from PySide6.QtGui import QFont, QKeySequence, QIcon, QDrag, QPixmap, QPainter, QShortcut, QAction
 
 # Session (Watch Together) support — imported lazily to keep solo mode clean
 try:
@@ -29,77 +29,31 @@ except ImportError:
     SessionClient = None  # type: ignore[assignment,misc]
     SESSION_AVAILABLE = False
 
+# Handle Nuitka MPV dll bundling so python-mpv can find mpv-1.dll
+if "__compiled__" in globals():
+    # Running as compiled Nuitka executable
+    base_dir = os.path.dirname(sys.executable)
+    os.environ["PATH"] = os.path.join(base_dir, "lib") + os.pathsep + os.environ.get("PATH", "")
+else:
+    # Running from source
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    os.environ["PATH"] = os.path.join(base_dir, "lib") + os.pathsep + os.environ.get("PATH", "")
+
+import mpv
+
 # ============================================================================
-# VLC Detection and Setup
+# MPV Player Signals (thread-safe communication from MPV to UI)
 # ============================================================================
 
-def setup_vlc():
-    """Attempt to find VLC and configure paths before importing"""
-    if sys.platform != "win32":
-        return True
-        
-    import winreg
-    
-    def check_vlc_path(path):
-        if path and os.path.exists(os.path.join(path, "libvlc.dll")):
-            return path
-        return None
-    
-    vlc_path = None
-    
-    # Try registry locations
-    registry_paths = [
-        "SOFTWARE\\VideoLAN\\VLC",
-        "SOFTWARE\\WOW6432Node\\VideoLAN\\VLC"
-    ]
-    
-    for reg_path in registry_paths:
-        try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
-            path, _ = winreg.QueryValueEx(key, "InstallDir")
-            winreg.CloseKey(key)
-            vlc_path = check_vlc_path(path)
-            if vlc_path:
-                break
-        except OSError:
-            continue
-    
-    # Try standard installation paths
-    if not vlc_path:
-        standard_paths = [
-            r"C:\Program Files\VideoLAN\VLC",
-            r"C:\Program Files (x86)\VideoLAN\VLC"
-        ]
-        for path in standard_paths:
-            vlc_path = check_vlc_path(path)
-            if vlc_path:
-                break
-    
-    if vlc_path:
-        os.environ["PATH"] = vlc_path + ";" + os.environ.get("PATH", "")
-        if hasattr(os, 'add_dll_directory'):
-            try:
-                os.add_dll_directory(vlc_path)
-            except Exception:
-                pass
-        os.environ["PYTHON_VLC_LIB_PATH"] = os.path.join(vlc_path, "libvlc.dll")
-        return True
-    
-    return False
-
-# Setup VLC before importing
-vlc_found = setup_vlc()
-
-if sys.platform == "win32" and not vlc_found:
-    ctypes.windll.user32.MessageBoxW(
-        0, 
-        "VLC Media Player not found.\n\nPlease install VLC from videolan.org", 
-        "Random Clip Player - Error", 
-        0x10
-    )
-    sys.exit(1)
-
-import vlc
+class PlayerSignals(QObject):
+    """
+    Signals used to route MPV property observers (which run on a background thread)
+    safely back to the Qt main thread to update the GUI without crashing.
+    """
+    time_updated = Signal(float)
+    duration_changed = Signal(float)
+    eof_reached = Signal()
+    playback_state_changed = Signal(bool) # True = playing, False = paused
 
 # ============================================================================
 # Constants
@@ -136,7 +90,13 @@ class ConfigManager:
     """Handles loading and saving of application settings"""
     
     def __init__(self):
-        self.config_file = Path("config.json")
+        appdata = os.environ.get('APPDATA')
+        if appdata:
+            self.config_dir = Path(appdata) / "RandomClipPlayer"
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            self.config_file = self.config_dir / "config.json"
+        else:
+            self.config_file = Path("config.json")
         self.default_config = {
             "clips_folder": "",
             "volume": 80,
@@ -177,14 +137,26 @@ class ConfigManager:
         self._save_timer.timeout.connect(self._do_save)
 
     def load_config(self):
-        """Load config from JSON file or return defaults"""
+        """Load config from JSON file or return defaults (deep-merged)"""
         if self.config_file.exists():
             try:
                 with open(self.config_file, 'r') as f:
-                    return {**self.default_config, **json.load(f)}
+                    saved = json.load(f)
+                return self._deep_merge(self.default_config, saved)
             except Exception:
                 return self.default_config.copy()
         return self.default_config.copy()
+
+    @staticmethod
+    def _deep_merge(defaults: dict, overrides: dict) -> dict:
+        """Recursively merge overrides into defaults so nested dicts keep new default keys."""
+        merged = defaults.copy()
+        for key, value in overrides.items():
+            if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+                merged[key] = ConfigManager._deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
 
     def save_config(self):
         """Debounce save requests"""
@@ -226,7 +198,7 @@ class BlockedListDialog(QDialog):
         
         for clip in self.blocked_clips:
             item = QListWidgetItem(os.path.basename(clip))
-            item.setData(Qt.UserRole, clip)
+            item.setData(Qt.ItemDataRole.UserRole, clip)
             self.list_widget.addItem(item)
             
         layout.addWidget(self.list_widget)
@@ -250,7 +222,7 @@ class BlockedListDialog(QDialog):
     def unblock_selected(self):
         selected_items = self.list_widget.selectedItems()
         for item in selected_items:
-            clip_path = item.data(Qt.UserRole)
+            clip_path = item.data(Qt.ItemDataRole.UserRole)
             self.removed_clips.add(clip_path)
             self.list_widget.takeItem(self.list_widget.row(item))
             
@@ -305,7 +277,7 @@ class KeybindButton(QPushButton):
         self.capturing = False
         
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             self.capturing = True
             self.setText("Press a key...")
             self.setStyleSheet(f"background-color: {COLORS['accent_blue']}; color: white; padding: 4px 8px; border-radius: 4px;")
@@ -316,22 +288,22 @@ class KeybindButton(QPushButton):
             key = event.key()
             # Map Qt key to readable name
             key_map = {
-                Qt.Key_Space: "Space", Qt.Key_Return: "Return", Qt.Key_Escape: "Escape",
-                Qt.Key_Backspace: "Backspace", Qt.Key_Delete: "Delete", Qt.Key_Tab: "Tab",
-                Qt.Key_Left: "Left", Qt.Key_Right: "Right", Qt.Key_Up: "Up", Qt.Key_Down: "Down",
-                Qt.Key_Period: "Period", Qt.Key_Comma: "Comma",
-                Qt.Key_Home: "Home", Qt.Key_End: "End", Qt.Key_PageUp: "PageUp", Qt.Key_PageDown: "PageDown",
+                Qt.Key.Key_Space: "Space", Qt.Key.Key_Return: "Return", Qt.Key.Key_Escape: "Escape",
+                Qt.Key.Key_Backspace: "Backspace", Qt.Key.Key_Delete: "Delete", Qt.Key.Key_Tab: "Tab",
+                Qt.Key.Key_Left: "Left", Qt.Key.Key_Right: "Right", Qt.Key.Key_Up: "Up", Qt.Key.Key_Down: "Down",
+                Qt.Key.Key_Period: "Period", Qt.Key.Key_Comma: "Comma",
+                Qt.Key.Key_Home: "Home", Qt.Key.Key_End: "End", Qt.Key.Key_PageUp: "PageUp", Qt.Key.Key_PageDown: "PageDown",
             }
             
             new_key = None
             if key in key_map:
                 new_key = key_map[key]
-            elif Qt.Key_A <= key <= Qt.Key_Z:
+            elif Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
                 new_key = chr(key)
-            elif Qt.Key_0 <= key <= Qt.Key_9:
+            elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
                 new_key = chr(key)
-            elif Qt.Key_F1 <= key <= Qt.Key_F12:
-                new_key = f"F{key - Qt.Key_F1 + 1}"
+            elif Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12:
+                new_key = f"F{key - Qt.Key.Key_F1 + 1}"
             else:
                 new_key = QKeySequence(key).toString()
             
@@ -572,8 +544,8 @@ class ClickableSlider(QSlider):
         self.setMouseTracking(True)
         
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            val = self.minimum() + ((self.maximum() - self.minimum()) * event.x()) / self.width()
+        if event.button() == Qt.MouseButton.LeftButton:
+            val = self.minimum() + ((self.maximum() - self.minimum()) * event.position().x()) / self.width()
             self.setValue(int(val))
             self.sliderMoved.emit(int(val))
         super().mousePressEvent(event)
@@ -601,16 +573,16 @@ class DraggableWidget(QWidget):
     def eventFilter(self, obj, event):
         """Intercept mouse events on the button when Alt is held"""
         if obj == self.inner_widget:
-            if event.type() == event.MouseButtonPress and event.button() == Qt.LeftButton:
-                if event.modifiers() & Qt.AltModifier:
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if event.modifiers() & Qt.KeyboardModifier.AltModifier:
                     self._drag_start = event.pos()
                     return True  # Consume the event
-            elif event.type() == event.MouseMove and self._drag_start:
-                if event.modifiers() & Qt.AltModifier:
+            elif event.type() == QEvent.Type.MouseMove and self._drag_start:
+                if event.modifiers() & Qt.KeyboardModifier.AltModifier:
                     if (event.pos() - self._drag_start).manhattanLength() > 10:
                         self._start_drag(event.pos())
                     return True
-            elif event.type() == event.MouseButtonRelease:
+            elif event.type() == QEvent.Type.MouseButtonRelease:
                 self._drag_start = None
         return super().eventFilter(obj, event)
     
@@ -623,10 +595,8 @@ class DraggableWidget(QWidget):
         
         # Create pixmap of widget for visual drag
         pixmap = QPixmap(self.size())
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        self.render(painter)
-        painter.end()
+        pixmap.fill(Qt.GlobalColor.transparent)
+        self.render(pixmap)
         drag.setPixmap(pixmap)
         drag.setHotSpot(pos)
         
@@ -635,7 +605,7 @@ class DraggableWidget(QWidget):
         if parent and hasattr(parent, 'set_rearrange_mode'):
             parent.set_rearrange_mode(True)
         
-        drag.exec_(Qt.MoveAction)
+        drag.exec(Qt.DropAction.MoveAction)
         
         if parent and hasattr(parent, 'set_rearrange_mode'):
             parent.set_rearrange_mode(False)
@@ -643,7 +613,7 @@ class DraggableWidget(QWidget):
         self._drag_start = None
         
     def dragEnterEvent(self, event):
-        if event.mimeData().hasText() and (event.keyboardModifiers() & Qt.AltModifier):
+        if event.mimeData().hasText() and (event.keyboardModifiers() & Qt.KeyboardModifier.AltModifier):
             event.acceptProposedAction()
             # Highlight drop target
             self.setStyleSheet(f"background-color: {COLORS['accent_blue']}; border-radius: 4px;")
@@ -787,7 +757,7 @@ class SpeedButton(QPushButton):
         self.current_speed = 1.0
         self.speed_changed = None  # Callback set by VideoPlayer
         self.setMinimumHeight(36)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._apply_style()
         
     def _apply_style(self):
@@ -856,7 +826,7 @@ class StyledButton(QPushButton):
         super().__init__(text, parent)
         self.color_scheme = color
         self.setMinimumHeight(44)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._apply_style()
         
     def _apply_style(self):
@@ -949,7 +919,7 @@ class SessionPanel(QFrame):
     """Collapsible right-side panel for Watch Together session management."""
 
     # Signal to safely pass test results from background thread to UI
-    _test_result_signal = pyqtSignal(bool, str)
+    _test_result_signal = Signal(bool, str)
 
     def __init__(self, config_manager, parent=None):
         super().__init__(parent)
@@ -957,6 +927,11 @@ class SessionPanel(QFrame):
         self.session_client = None
         self._player = parent  # Reference to VideoPlayer
         self.setAcceptDrops(True)  # Enable drag & drop for video sharing
+
+        # Pending sync state (set when joining mid-session)
+        self._pending_sync_state: dict = {}
+        self._pending_sync_video_id: str | None = None
+        self._pending_prepare_video_id: str | None = None
 
         self.setFixedWidth(280)
         self.setStyleSheet(f"""
@@ -1005,7 +980,7 @@ class SessionPanel(QFrame):
 
         # Test connection button
         self.test_btn = QPushButton("Test Connection")
-        self.test_btn.setCursor(Qt.PointingHandCursor)
+        self.test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.test_btn.setStyleSheet(self._btn_style())
         self.test_btn.clicked.connect(self._test_connection)
         conn_layout.addWidget(self.test_btn)
@@ -1029,7 +1004,7 @@ class SessionPanel(QFrame):
         self.create_pw_input = self._make_input("", "Room password", password=True)
         conn_layout.addWidget(self.create_pw_input)
         self.create_btn = QPushButton("🏠  Create Room")
-        self.create_btn.setCursor(Qt.PointingHandCursor)
+        self.create_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.create_btn.setStyleSheet(self._btn_style(COLORS['accent_green']))
         self.create_btn.clicked.connect(self._create_room)
         conn_layout.addWidget(self.create_btn)
@@ -1043,7 +1018,7 @@ class SessionPanel(QFrame):
         self.join_pw_input = self._make_input("", "Room password", password=True)
         conn_layout.addWidget(self.join_pw_input)
         self.join_btn = QPushButton("🔗  Join Room")
-        self.join_btn.setCursor(Qt.PointingHandCursor)
+        self.join_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.join_btn.setStyleSheet(self._btn_style(COLORS['accent_blue']))
         self.join_btn.clicked.connect(self._join_room)
         conn_layout.addWidget(self.join_btn)
@@ -1066,7 +1041,7 @@ class SessionPanel(QFrame):
         room_row.addWidget(self.room_info_label, stretch=1)
 
         self.copy_code_btn = QPushButton("📋 Copy")
-        self.copy_code_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_code_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copy_code_btn.setFixedWidth(70)
         self.copy_code_btn.setStyleSheet(f"""
             QPushButton {{
@@ -1092,7 +1067,7 @@ class SessionPanel(QFrame):
         sess_layout.addWidget(self.ping_label)
 
         # Shared random pool toggle (host only)
-        from PyQt5.QtWidgets import QCheckBox
+        from PySide6.QtWidgets import QCheckBox
         self.shared_pool_cb = QCheckBox("🎲 Shared random pool")
         self.shared_pool_cb.setToolTip("When on, Random Clip picks from a random user's gallery")
         self.shared_pool_cb.setStyleSheet(f"""
@@ -1143,10 +1118,10 @@ class SessionPanel(QFrame):
         sess_layout.addWidget(self._make_label("Activity"))
         self.activity_feed = QListWidget()
         self.activity_feed.setMaximumHeight(100)
-        self.activity_feed.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.activity_feed.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.activity_feed.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.activity_feed.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.activity_feed.setSelectionMode(QListWidget.NoSelection)
-        self.activity_feed.setFocusPolicy(Qt.NoFocus)
+        self.activity_feed.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.activity_feed.setStyleSheet(f"""
             QListWidget {{
                 background-color: {COLORS['bg_dark']};
@@ -1166,14 +1141,14 @@ class SessionPanel(QFrame):
 
         # Share clip button (also drop hint)
         self.share_btn = QPushButton("📤  Share Current Clip")
-        self.share_btn.setCursor(Qt.PointingHandCursor)
+        self.share_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.share_btn.setStyleSheet(self._btn_style(COLORS['accent_orange']))
         self.share_btn.clicked.connect(self._share_current_clip)
         sess_layout.addWidget(self.share_btn)
 
         # Drop hint
         self.drop_hint = QLabel("📂  or drag && drop a video file here")
-        self.drop_hint.setAlignment(Qt.AlignCenter)
+        self.drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.drop_hint.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 9px; border: none; font-style: italic;")
         sess_layout.addWidget(self.drop_hint)
 
@@ -1195,7 +1170,7 @@ class SessionPanel(QFrame):
 
         # Disconnect button
         self.disconnect_btn = QPushButton("❌  Disconnect")
-        self.disconnect_btn.setCursor(Qt.PointingHandCursor)
+        self.disconnect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.disconnect_btn.setStyleSheet(self._btn_style(COLORS['accent_red']))
         self.disconnect_btn.clicked.connect(self._disconnect)
         sess_layout.addWidget(self.disconnect_btn)
@@ -1213,7 +1188,7 @@ class SessionPanel(QFrame):
         return lbl
 
     def _make_input(self, value, placeholder, password=False):
-        from PyQt5.QtWidgets import QLineEdit
+        from PySide6.QtWidgets import QLineEdit
         inp = QLineEdit(value)
         inp.setPlaceholderText(placeholder)
         if password:
@@ -1241,7 +1216,7 @@ class SessionPanel(QFrame):
 
     # ---- Activity Feed ----
 
-    _VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.m4v', '.ts', '.mpg', '.mpeg'}
+    _VIDEO_EXTENSIONS = VIDEO_EXTENSIONS  # Reuse the module-level constant
 
     def add_activity(self, text):
         """Add an entry to the activity feed (max 50 items, auto-scrolls)."""
@@ -1605,7 +1580,7 @@ class SessionPanel(QFrame):
         # Can't kick yourself
         if uid == self.session_client.user_id:
             return
-        from PyQt5.QtWidgets import QMenu
+        from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu {{
@@ -1619,7 +1594,7 @@ class SessionPanel(QFrame):
         kick_action = menu.addAction(f"🚫 Kick {uname}")
         viewport = self.users_list.viewport()
         assert viewport is not None
-        action = menu.exec_(viewport.mapToGlobal(pos))
+        action = menu.exec(viewport.mapToGlobal(pos))
         if action == kick_action:
             self.session_client.send_kick(uid)
             self.add_activity(f"🚫 You kicked {uname}")
@@ -1674,16 +1649,16 @@ class SessionPanel(QFrame):
                 speed = sync_state.get('speed', 1.0)
                 is_playing = sync_state.get('playing', False)
                 def _apply_sync():
-                    if not self._player:
+                    if not self._player or not self._player.player:
                         return
                     self._player._ignore_remote = True
                     if position > 0.01:
-                        self._player.player.set_position(position)
+                        self._player.player.seek(position, reference='absolute')
                     if speed != 1.0:
-                        self._player.player.set_rate(speed)
+                        self._player.player.speed = speed
                         self._player.slow_mo_btn.set_speed(speed)
                     if not is_playing:
-                        self._player.player.pause()
+                        self._player.player.pause = True
                         self._player.play_btn.setText("▶  Play")
                     self._player._ignore_remote = False
                     self.add_activity("🔄 Synced to position")
@@ -1718,18 +1693,18 @@ class SessionPanel(QFrame):
 
     def _host_wait_for_ready(self, video_id):
         """Host uploaded a clip — pause and wait for all users to be ready."""
-        if self._player:
+        if self._player and self._player.player:
             self._player._ignore_remote = True
-            self._player.player.pause()
+            self._player.player.pause = True
             self._player.play_btn.setText("▶  Play")
             self._player._ignore_remote = False
         self.progress_label.setText("⏳ Waiting for everyone to download...")
 
     def _pause_and_report_ready(self, video_id):
         """Pause video and tell server we're ready."""
-        if self._player:
+        if self._player and self._player.player:
             self._player._ignore_remote = True
-            self._player.player.pause()
+            self._player.player.pause = True
             self._player.play_btn.setText("▶  Play")
             self._player._ignore_remote = False
         self.progress_label.setText("⏳ Waiting for everyone...")
@@ -1748,14 +1723,13 @@ class SessionPanel(QFrame):
         self.add_activity("✅ All synced — playing!")
         self.progress_label.setText("▶ Playing!")
         QTimer.singleShot(2000, lambda: self.progress_label.setText(""))
-        if self._player:
+        if self._player and self._player.player:
             self._player._session_uploading = False
             self._player._playing_remote_clip = True  # Don't re-share when this clip ends
             self._player._ignore_remote = True
-            self._player.player.set_position(0.0)
-            self._player.player.play()
+            self._player.player.seek(0, reference='absolute')
+            self._player.player.pause = False
             self._player.play_btn.setText("⏸  Pause")
-            self._player.timer.start()
             self._player._apply_current_speed()
             self._player._ignore_remote = False
 
@@ -1815,10 +1789,9 @@ class VideoPlayer(QMainWindow):
         # Initialize Configuration
         self.config_manager = ConfigManager()
         
-        # VLC instance and player
-        self.instance = vlc.Instance('--no-xlib')
-        assert self.instance is not None, "Failed to create VLC instance"
-        self.player = self.instance.media_player_new()
+        self.player = None
+        self.player_signals = PlayerSignals()
+        self._cached_duration = 0.0
         
         # Folder path from config
         self.clips_folder = self.config_manager.get("clips_folder")
@@ -1837,7 +1810,7 @@ class VideoPlayer(QMainWindow):
         # UI state
         self.is_slider_pressed = False
         self._last_volume = self.config_manager.get("volume")
-        self._cached_fps = 0  # Cache FPS to avoid repeated VLC calls
+        self._cached_fps = 0  # Cache FPS to avoid repeated property queries
         
         # Session (Watch Together) state
         self._session_active = False
@@ -1847,10 +1820,18 @@ class VideoPlayer(QMainWindow):
         self._playing_remote_clip = False  # True when current clip came from another user
         self._session_uploading = False    # True while uploading a clip to session
         
-        # Setup UI
+        # Setup UI (must come before MPV init so video_frame exists)
         self._setup_ui()
         self._create_menu_bar()
         self._apply_global_styles()
+
+        # MPV instance and player — create AFTER UI is fully styled
+        self.player = mpv.MPV(wid=int(self.video_frame.winId()), vo='gpu', hwdec='auto', keep_open=True)
+        self._setup_mpv_callbacks()
+        
+        # Set initial volume
+        self.player.volume = int(self._last_volume or 80)
+
         self._setup_keyboard_shortcuts()
         
         # Initial folder check
@@ -1861,11 +1842,7 @@ class VideoPlayer(QMainWindow):
             self.scan_folder()
             self._update_status_bar()
         
-        # Timer for updating slider and time (smoother at 20fps)
-        self.timer = QTimer(self)
-        self.timer.setInterval(50)
-        self.timer.timeout.connect(self._update_playback_ui)
-        
+
         # Auto-hide timer for controls
         self.hide_controls_timer = QTimer(self)
         self.hide_controls_timer.setInterval(2000)  # 2 seconds
@@ -1940,7 +1917,7 @@ class VideoPlayer(QMainWindow):
         
         exit_action = QAction("Exit", self)
         exit_action.setShortcut("Ctrl+Q")
-        exit_action.triggered.connect(lambda: (self.close(), None)[-1])
+        exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         
         # Settings Menu
@@ -1969,7 +1946,7 @@ class VideoPlayer(QMainWindow):
     def show_settings_dialog(self):
         """Show the settings dialog"""
         dialog = SettingsDialog(self.config_manager, self)
-        if dialog.exec_():
+        if dialog.exec():
             # Reload keybinds after saving
             self._setup_keyboard_shortcuts()
             # Update auto-hide state
@@ -1997,7 +1974,7 @@ class VideoPlayer(QMainWindow):
     def show_blocked_dialog(self):
         """Show dialog to manage blocked clips"""
         dialog = BlockedListDialog(self.blocked_clips, self)
-        if dialog.exec_():
+        if dialog.exec():
             removed = dialog.get_removed_clips()
             if removed:
                 self.blocked_clips -= removed
@@ -2050,7 +2027,7 @@ class VideoPlayer(QMainWindow):
         
         self.status_label = QLabel("")
         self.status_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
-        self.status_label.setAlignment(Qt.AlignRight)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         
         info_layout.addWidget(self.video_label, stretch=1)
         info_layout.addWidget(self.status_label)
@@ -2064,9 +2041,9 @@ class VideoPlayer(QMainWindow):
         self.time_label = QLabel("0:00")
         self.time_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 11px; font-family: 'Consolas', monospace;")
         self.time_label.setFixedWidth(40)
-        self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         
-        self.time_slider = ClickableSlider(Qt.Horizontal)
+        self.time_slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.time_slider.setRange(0, 1000)
         self.time_slider.sliderMoved.connect(self._set_position)
         self.time_slider.sliderPressed.connect(self._slider_pressed)
@@ -2185,7 +2162,7 @@ class VideoPlayer(QMainWindow):
         self.volume_icon.setFixedWidth(16)
         volume_layout.addWidget(self.volume_icon)
         
-        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(int(self._last_volume or 80))
         self.volume_slider.setMinimumWidth(50)
@@ -2203,16 +2180,13 @@ class VideoPlayer(QMainWindow):
         self.clip_counter = QLabel("0 / 0")
         self.clip_counter.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 11px; font-weight: bold;")
         self.clip_counter.setMinimumWidth(70)
-        self.clip_counter.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.clip_counter.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.clip_counter.setToolTip("Position / Total clips")
         volume_layout.addWidget(self.clip_counter)
         
         container_layout.addWidget(volume_widget)
         
         main_layout.addWidget(self.controls_container)
-        
-        # Set initial volume
-        self.player.audio_set_volume(int(self._last_volume or 80))
         
         # Add main content to top layout
         top_layout.addWidget(main_container, stretch=1)
@@ -2278,21 +2252,21 @@ class VideoPlayer(QMainWindow):
         
         # Key name to Qt key mapping
         key_map = {
-            "Space": Qt.Key_Space, "Return": Qt.Key_Return, "Escape": Qt.Key_Escape,
-            "Backspace": Qt.Key_Backspace, "Delete": Qt.Key_Delete, "Tab": Qt.Key_Tab,
-            "Left": Qt.Key_Left, "Right": Qt.Key_Right, "Up": Qt.Key_Up, "Down": Qt.Key_Down,
-            "Period": Qt.Key_Period, "Comma": Qt.Key_Comma,
-            "Home": Qt.Key_Home, "End": Qt.Key_End, "PageUp": Qt.Key_PageUp, "PageDown": Qt.Key_PageDown,
+            "Space": Qt.Key.Key_Space, "Return": Qt.Key.Key_Return, "Escape": Qt.Key.Key_Escape,
+            "Backspace": Qt.Key.Key_Backspace, "Delete": Qt.Key.Key_Delete, "Tab": Qt.Key.Key_Tab,
+            "Left": Qt.Key.Key_Left, "Right": Qt.Key.Key_Right, "Up": Qt.Key.Key_Up, "Down": Qt.Key.Key_Down,
+            "Period": Qt.Key.Key_Period, "Comma": Qt.Key.Key_Comma,
+            "Home": Qt.Key.Key_Home, "End": Qt.Key.Key_End, "PageUp": Qt.Key.Key_PageUp, "PageDown": Qt.Key.Key_PageDown,
         }
         # Add letter keys A-Z
         for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-            key_map[c] = getattr(Qt, f"Key_{c}")
+            key_map[c] = getattr(Qt.Key, f"Key_{c}")
         # Add number keys 0-9
         for n in "0123456789":
-            key_map[n] = getattr(Qt, f"Key_{n}")
+            key_map[n] = getattr(Qt.Key, f"Key_{n}")
         # Add function keys F1-F12
         for i in range(1, 13):
-            key_map[f"F{i}"] = getattr(Qt, f"Key_F{i}")
+            key_map[f"F{i}"] = getattr(Qt.Key, f"Key_F{i}")
         
         # Action name to callback mapping
         action_map = {
@@ -2583,26 +2557,77 @@ class VideoPlayer(QMainWindow):
     # Playback Control
     # ========================================================================
 
+    def _setup_mpv_callbacks(self):
+        """Connect MPV property observers to Qt Signals to safely bridge threads"""
+        if self.player is None:
+            return
+        player = self.player  # local ref for type narrowing
+        # MPV runs these callbacks on its own background thread
+        @player.property_observer('time-pos')
+        def time_observer(_name, value):
+            if value is not None:
+                self.player_signals.time_updated.emit(value)
+                
+        @player.property_observer('duration')
+        def duration_observer(_name, value):
+            if value is not None:
+                self.player_signals.duration_changed.emit(value)
+                
+        @player.property_observer('eof-reached')
+        def eof_observer(_name, value):
+            if value:
+                self.player_signals.eof_reached.emit()
+                
+        @player.property_observer('pause')
+        def pause_observer(_name, value):
+            if value is not None:
+                self.player_signals.playback_state_changed.emit(not value)
+                
+        # Connect Qt Signals to slots (this runs on the main thread)
+        self.player_signals.time_updated.connect(self._on_mpv_time)
+        self.player_signals.duration_changed.connect(self._on_mpv_duration)
+        self.player_signals.eof_reached.connect(self._on_video_finished)
+        self.player_signals.playback_state_changed.connect(self._on_mpv_pause_changed)
+
+    def _on_mpv_time(self, current_time):
+        if self._cached_duration > 0 and not self.is_slider_pressed:
+            val = int((current_time / self._cached_duration) * 1000)
+            self.time_slider.setValue(val)
+        self.time_label.setText(self._format_time(int(current_time * 1000)))
+        
+    def _on_mpv_duration(self, duration):
+        self._cached_duration = duration
+        self.duration_label.setText(self._format_time(int(duration * 1000)))
+        
+    def _on_video_finished(self):
+        if self.autoplay_enabled:
+            # In a session, only the host triggers autoplay
+            client = self._get_session_client()
+            if client and not client.is_host:
+                self.play_btn.setText("▶  Play")
+                self.status_label.setText("⏳ Waiting for host...")
+            else:
+                QTimer.singleShot(50, self.play_random_clip)
+        else:
+            self.play_btn.setText("▶  Play")
+            
+    def _on_mpv_pause_changed(self, is_playing):
+        if is_playing:
+            self.play_btn.setText("⏸  Pause")
+            self._apply_current_speed()
+        else:
+            self.play_btn.setText("▶  Play")
+
     def _play_video(self, filepath):
         """Play a specific video file"""
+        if not self.player:
+            return
         if DEBUG_MODE:
             logging.getLogger("rdm").debug(f"_play_video: {filepath}")
-        assert self.instance is not None
-        media = self.instance.media_new(filepath)
-        self.player.set_media(media)
+            
+        self.player.play(filepath)
         
-        # Set video output based on platform
-        if sys.platform.startswith('linux'):
-            self.player.set_xwindow(self.video_frame.winId())
-        elif sys.platform == "win32":
-            self.player.set_hwnd(self.video_frame.winId())
-        elif sys.platform == "darwin":
-            self.player.set_nsobject(int(self.video_frame.winId()))
-        
-        self.player.play()
-        self.timer.start()
-        
-        # Cache FPS after a short delay (VLC needs time to read metadata)
+        # Cache FPS after a short delay
         QTimer.singleShot(200, self._cache_fps)
         
         # Update UI with truncated filename
@@ -2610,42 +2635,30 @@ class VideoPlayer(QMainWindow):
         display_name = filename if len(filename) <= 65 else filename[:62] + "..."
         self.video_label.setText(f"▶  {display_name}")
         self.video_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px; padding: 6px 4px;")
-        self.play_btn.setText("⏸  Pause")
         
         # Apply current playback rate from speed button
         self._apply_current_speed()
 
     def _toggle_play_pause(self):
         """Toggle between play and pause states"""
-        state = self.player.get_state()
-        
-        if state == vlc.State.Ended:
-            self.player.stop()
-            self.player.play()
-            self.play_btn.setText("⏸  Pause")
-            self.timer.start()
-            if self.slow_mo_btn.isChecked():
-                self.player.set_rate(0.5)
+        if not self.player:
+            return
+        self.player.pause = not self.player.pause
+        if not self.player.pause:
             self._session_send_play()
-        elif self.player.is_playing():
-            self.player.pause()
-            self.play_btn.setText("▶  Play")
-            self._session_send_pause()
         else:
-            self.player.play()
-            self.play_btn.setText("⏸  Pause")
-            self.timer.start()
-            self._apply_current_speed()
-            self._session_send_play()
+            self._session_send_pause()
 
     def _toggle_slow_motion(self):
         """Toggle between 0.5x and 1.0x speed"""
+        if not self.player:
+            return
         if self.slow_mo_btn.isChecked():
             self.slow_mo_btn.set_speed(0.5)
-            self.player.set_rate(0.5)
+            self.player.speed = 0.5
         else:
             self.slow_mo_btn.set_speed(1.0)
-            self.player.set_rate(1.0)
+            self.player.speed = 1.0
 
     def _toggle_slow_motion_keyboard(self):
         """Toggle slow motion via keyboard"""
@@ -2654,20 +2667,25 @@ class VideoPlayer(QMainWindow):
         
     def _set_playback_speed(self, speed):
         """Set playback speed from scroll wheel"""
-        self.player.set_rate(speed)
+        if not self.player:
+            return
+        self.player.speed = speed
         self.status_label.setText(f"Speed: {speed}x")
         QTimer.singleShot(1500, self._update_status_bar)
         self._session_send_speed(speed)
         
     def _apply_current_speed(self):
         """Apply the current speed setting from the button"""
+        if not self.player:
+            return
         speed = self.slow_mo_btn.current_speed
-        self.player.set_rate(speed)
+        self.player.speed = speed
 
     def _stop(self):
         """Stop playback completely"""
+        if not self.player:
+            return
         self.player.stop()
-        self.timer.stop()
         self.play_btn.setText("▶  Play")
         self.time_slider.setValue(0)
         self.time_label.setText("0:00")
@@ -2676,15 +2694,23 @@ class VideoPlayer(QMainWindow):
 
     def _skip(self, ms):
         """Skip forward or backward by milliseconds"""
-        current = self.player.get_time()
-        duration = self.player.get_length()
-        new_time = max(0, min(duration, current + ms))
-        self.player.set_time(int(new_time))
+        if not self.player:
+            return
+        current = self.player.time_pos or 0.0
+        duration = self.player.duration or 0.0
+        new_time = max(0, min(duration, current + (ms / 1000.0)))
+        self.player.seek(new_time, reference='absolute')
 
     def _cache_fps(self):
         """Cache the FPS of current video"""
-        fps = self.player.get_fps()
-        self._cached_fps = fps if fps and fps > 0 else 0
+        if not self.player:
+            return
+        fps = self.player.estimated_vf_fps or self.player.container_fps
+        try:
+            fps_val = float(fps) if fps else 0.0
+            self._cached_fps = fps_val if fps_val > 0 else 0.0
+        except (TypeError, ValueError):
+            self._cached_fps = 0.0
 
     def _get_frame_duration_ms(self):
         """Get the duration of one frame in milliseconds based on cached fps"""
@@ -2693,33 +2719,33 @@ class VideoPlayer(QMainWindow):
         return 33  # Default to ~30fps if unknown
 
     def _frame_step_forward(self):
-        """Advance one frame forward based on video fps"""
-        if self.player.is_playing():
-            self.player.pause()
-            self.play_btn.setText("▶  Play")
-        frame_ms = self._get_frame_duration_ms()
-        current = self.player.get_time()
-        self.player.set_time(current + frame_ms)
+        """Advance one frame forward"""
+        if not self.player:
+            return
+        self.player.pause = True
+        self.player.command('frame-step')
         fps = self._cached_fps or 30
         self.status_label.setText(f"⏭ +1 frame ({fps:.0f}fps)")
         QTimer.singleShot(1000, self._update_status_bar)
 
     def _frame_step_backward(self):
-        """Step backward one frame based on video fps"""
-        if self.player.is_playing():
-            self.player.pause()
-            self.play_btn.setText("▶  Play")
-        frame_ms = self._get_frame_duration_ms()
-        current = self.player.get_time()
-        self.player.set_time(max(0, current - frame_ms))
+        """Step backward one frame"""
+        if not self.player:
+            return
+        self.player.pause = True
+        self.player.command('frame-back-step')
         fps = self._cached_fps or 30
         self.status_label.setText(f"⏮ -1 frame ({fps:.0f}fps)")
         QTimer.singleShot(1000, self._update_status_bar)
 
     def _set_position(self, position):
         """Set video position from slider"""
-        self.player.set_position(position / 1000.0)
-        self._session_send_seek(position / 1000.0)
+        if not self.player:
+            return
+        if self._cached_duration > 0:
+            pos_sec = (position / 1000.0) * self._cached_duration
+            self.player.seek(pos_sec, reference='absolute')
+            self._session_send_seek(pos_sec)
 
     def _slider_pressed(self):
         """Handle slider press"""
@@ -2732,11 +2758,13 @@ class VideoPlayer(QMainWindow):
 
     def _set_volume(self, volume):
         """Set audio volume"""
-        self.player.audio_set_volume(volume)
+        if self.player:
+            self.player.volume = volume
         self.volume_label.setText(f"{volume}%")
         
-        # Save volume preference
-        self.config_manager.set("volume", volume)
+        # Save volume preference (but don't persist 0 from muting)
+        if volume > 0:
+            self.config_manager.set("volume", volume)
         
         # Update icon based on volume level
         if volume == 0:
@@ -2751,43 +2779,14 @@ class VideoPlayer(QMainWindow):
     def _toggle_mute(self):
         """Toggle mute state"""
         if self.volume_slider.value() > 0:
-            self._last_volume = self.volume_slider.value()
+            self._unmute_volume = self.volume_slider.value()  # Remember for unmute only
             self.volume_slider.setValue(0)
         else:
-            self.volume_slider.setValue(int(self._last_volume or 80))
+            self.volume_slider.setValue(int(getattr(self, '_unmute_volume', None) or self._last_volume or 80))
 
     # ========================================================================
     # UI Updates
     # ========================================================================
-
-    def _update_playback_ui(self):
-        """Update playback-related UI elements"""
-        if not self.is_slider_pressed:
-            position = self.player.get_position()
-            self.time_slider.setValue(int(position * 1000))
-        
-        current_time = self.player.get_time()
-        duration = self.player.get_length()
-        
-        self.time_label.setText(self._format_time(current_time))
-        self.duration_label.setText(self._format_time(duration))
-        
-        # Handle video end
-        state = self.player.get_state()
-        if state == vlc.State.Ended:
-            if self.autoplay_enabled:
-                # In a session, only the host triggers autoplay
-                client = self._get_session_client()
-                if client and not client.is_host:
-                    # Non-host: just stop, wait for host's next clip
-                    self.timer.stop()
-                    self.play_btn.setText("▶  Play")
-                    self.status_label.setText("⏳ Waiting for host...")
-                else:
-                    QTimer.singleShot(50, self.play_random_clip)
-            else:
-                self.timer.stop()
-                self.play_btn.setText("▶  Play")
 
     def _update_clip_counter(self):
         """Update the clip counter display"""
@@ -2877,7 +2876,7 @@ class VideoPlayer(QMainWindow):
             # Animate opacity/position
             if hasattr(self, '_controls_animation'):
                 self._controls_animation.stop()
-            self.controls_container.setMaximumHeight(60)
+            self.controls_container.setMaximumHeight(16777215)  # QWIDGETSIZE_MAX — remove constraint
             
     def _hide_controls(self):
         """Hide the controls bar with slide animation if auto-hide is enabled"""
@@ -2955,8 +2954,8 @@ class VideoPlayer(QMainWindow):
         if self._ignore_remote:
             return
         client = self._get_session_client()
-        if client:
-            pos = self.player.get_position() or 0.0
+        if client and self.player:
+            pos = float(self.player.time_pos or 0.0)
             client.send_play(pos)
 
     def _session_send_pause(self):
@@ -2964,8 +2963,8 @@ class VideoPlayer(QMainWindow):
         if self._ignore_remote:
             return
         client = self._get_session_client()
-        if client:
-            pos = self.player.get_position() or 0.0
+        if client and self.player:
+            pos = float(self.player.time_pos or 0.0)
             client.send_pause(pos)
 
     def _session_send_seek(self, position):
@@ -2990,11 +2989,12 @@ class VideoPlayer(QMainWindow):
         """Another user pressed play."""
         if DEBUG_MODE:
             logging.getLogger("rdm").debug(f"Remote PLAY from {username} at pos={position:.4f}")
+        if not self.player:
+            return
         self._ignore_remote = True
-        self.player.set_position(position)
-        if not self.player.is_playing():
-            self.player.play()
-            self.timer.start()
+        self.player.seek(position, reference='absolute')
+        if self.player.pause:
+            self.player.pause = False
             self.play_btn.setText("⏸  Pause")
             self._apply_current_speed()
         self.status_label.setText(f"▶ {username} pressed play")
@@ -3003,27 +3003,33 @@ class VideoPlayer(QMainWindow):
 
     def _on_remote_pause(self, position, username):
         """Another user pressed pause."""
+        if not self.player:
+            return
         self._ignore_remote = True
-        if self.player.is_playing():
-            self.player.pause()
+        if not self.player.pause:
+            self.player.pause = True
             self.play_btn.setText("▶  Play")
-        self.player.set_position(position)
+        self.player.seek(position, reference='absolute')
         self.status_label.setText(f"⏸ {username} paused")
         QTimer.singleShot(2000, self._update_status_bar)
         self._ignore_remote = False
 
     def _on_remote_seek(self, position, username):
         """Another user seeked."""
+        if not self.player:
+            return
         self._ignore_remote = True
-        self.player.set_position(position)
+        self.player.seek(position, reference='absolute')
         self.status_label.setText(f"⏩ {username} seeked")
         QTimer.singleShot(2000, self._update_status_bar)
         self._ignore_remote = False
 
     def _on_remote_speed(self, speed, username):
         """Another user changed speed."""
+        if not self.player:
+            return
         self._ignore_remote = True
-        self.player.set_rate(speed)
+        self.player.speed = speed
         self.slow_mo_btn.set_speed(speed)
         self.status_label.setText(f"Speed: {speed}x by {username}")
         QTimer.singleShot(2000, self._update_status_bar)
@@ -3062,17 +3068,17 @@ class VideoPlayer(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up on window close"""
-        self.timer.stop()
         self.hide_controls_timer.stop()
         if hasattr(self, '_controls_animation'):
             self._controls_animation.stop()
         # Clean up session
         if self._session_panel:
             self._session_panel.cleanup()
-        self.player.stop()
-        self.player.release()
-        if self.instance:
-            self.instance.release()
+        if self.player:
+            try:
+                self.player.terminate()
+            except:
+                pass
         event.accept()
 
 
@@ -3118,10 +3124,7 @@ def main():
     if args.debug:
         _setup_debug()
 
-    # Enable high DPI scaling for crisp UI on 4K displays
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    
+    # Note: High DPI scaling is always enabled in Qt6/PySide6
     app = QApplication(sys.argv)
     app.setApplicationName("Random Clip Player")
     app.setStyle('Fusion')
@@ -3135,13 +3138,17 @@ def main():
     # Debug overlay: show a small label in the title bar
     if DEBUG_MODE:
         player.setWindowTitle("Random Clip Player v4.5 [DEBUG]")
-        logging.getLogger("rdm").info(f"VLC version: {vlc.libvlc_get_version()}")
+        if player.player is not None:
+            try:
+                logging.getLogger("rdm").info(f"MPV version: {player.player.mpv_version}")
+            except Exception:
+                pass
         logging.getLogger("rdm").info(f"Python: {sys.version}")
         logging.getLogger("rdm").info(f"Session module: {'available' if SESSION_AVAILABLE else 'NOT available'}")
 
     player.show()
     
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

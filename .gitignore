@@ -2,22 +2,38 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 
-# VS Code
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
 
-# PyInstaller
+# Build output
 build/
 dist/
 *.manifest
+*.exe
 
-# Virtual Environments
+# Virtual environments
 venv/
 env/
 .venv/
 
+# App config (user-specific)
 config.json
+
+# MPV DLL and archives (downloaded by scripts/download_mpv.py)
+lib/mpv-1.dll
+*.7z
+*.zip
 
 # Server
 server/.env
 server/uploads/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

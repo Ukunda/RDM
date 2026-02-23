@@ -16,7 +16,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from PySide6.QtCore import QObject, Signal
 
 # Use requests for HTTP (simpler, synchronous, runs in thread)
 import requests
@@ -32,48 +32,48 @@ class SessionSignals(QObject):
     """Qt signals emitted by the session client for the UI to react to."""
 
     # Connection
-    connected = pyqtSignal()                      # Successfully connected to server
-    disconnected = pyqtSignal(str)                 # Disconnected (reason)
-    connection_error = pyqtSignal(str)             # Failed to connect
+    connected = Signal()                      # Successfully connected to server
+    disconnected = Signal(str)                 # Disconnected (reason)
+    connection_error = Signal(str)             # Failed to connect
 
     # Room
-    room_created = pyqtSignal(str, str)            # (room_code, user_id)
-    room_joined = pyqtSignal(dict)                 # Full room state dict
-    room_error = pyqtSignal(str)                   # Room create/join error
+    room_created = Signal(str, str)            # (room_code, user_id)
+    room_joined = Signal(dict)                 # Full room state dict
+    room_error = Signal(str)                   # Room create/join error
 
     # Users
-    user_joined = pyqtSignal(str, list)            # (username, users_list)
-    user_left = pyqtSignal(str, list)              # (username, users_list)
-    user_kicked = pyqtSignal(str, str, list)        # (username, kicked_by, users_list)
-    kicked = pyqtSignal(str)                        # (message) — you were kicked
+    user_joined = Signal(str, list)            # (username, users_list)
+    user_left = Signal(str, list)              # (username, users_list)
+    user_kicked = Signal(str, str, list)        # (username, kicked_by, users_list)
+    kicked = Signal(str)                        # (message) — you were kicked
 
     # Playback sync
-    remote_play = pyqtSignal(float, str)           # (position, username)
-    remote_pause = pyqtSignal(float, str)          # (position, username)
-    remote_seek = pyqtSignal(float, str)           # (position, username)
-    remote_speed = pyqtSignal(float, str)          # (speed, username)
-    remote_play_video = pyqtSignal(str, str, str)  # (video_id, filename, username)
+    remote_play = Signal(float, str)           # (position, username)
+    remote_pause = Signal(float, str)          # (position, username)
+    remote_seek = Signal(float, str)           # (position, username)
+    remote_speed = Signal(float, str)          # (speed, username)
+    remote_play_video = Signal(str, str, str)  # (video_id, filename, username)
 
     # Video sharing
-    video_uploaded = pyqtSignal(str, str, int, str)  # (video_id, filename, size, uploader)
-    upload_progress = pyqtSignal(int, int)           # (bytes_sent, total_bytes)
-    download_progress = pyqtSignal(int, int)         # (bytes_recv, total_bytes)
-    video_ready = pyqtSignal(str, str)               # (video_id, local_filepath)
+    video_uploaded = Signal(str, str, int, str)  # (video_id, filename, size, uploader)
+    upload_progress = Signal(int, int)           # (bytes_sent, total_bytes)
+    download_progress = Signal(int, int)         # (bytes_recv, total_bytes)
+    video_ready = Signal(str, str)               # (video_id, local_filepath)
 
     # Ready-sync: server tells us to prepare a video, then signals all_ready
-    prepare_video = pyqtSignal(str, str, str)         # (video_id, filename, username) — download & wait
-    all_ready = pyqtSignal(str)                       # (video_id) — everyone is ready, start playback
-    ready_progress = pyqtSignal(int, int)             # (ready_count, total_count)
+    prepare_video = Signal(str, str, str)         # (video_id, filename, username) — download & wait
+    all_ready = Signal(str)                       # (video_id) — everyone is ready, start playback
+    ready_progress = Signal(int, int)             # (ready_count, total_count)
 
     # Sync on join
-    sync_to_video = pyqtSignal(str, str, dict)       # (video_id, filename, playback_state)
+    sync_to_video = Signal(str, str, dict)       # (video_id, filename, playback_state)
 
     # Shared pool — server asks you to provide a random clip
-    random_clip_requested = pyqtSignal()              # Server wants us to share a random clip
-    shared_pool_changed = pyqtSignal(bool, str)       # (enabled, changed_by)
+    random_clip_requested = Signal()              # Server wants us to share a random clip
+    shared_pool_changed = Signal(bool, str)       # (enabled, changed_by)
 
     # Ping
-    ping_result = pyqtSignal(int)                   # (latency_ms)
+    ping_result = Signal(int)                   # (latency_ms)
 
 
 # ============================================================================
@@ -753,20 +753,3 @@ class SessionClient:
             log.error(f"Download error: {e}")
             self.signals.room_error.emit(f"Download error: {e}")
 
-    # ====================================================================
-    # Cleanup
-    # ====================================================================
-
-    def cleanup(self):
-        """Clean up temp files and disconnect."""
-        self.stop_ping_loop()
-        if self._reconnect_timer:
-            self._reconnect_timer.cancel()
-            self._reconnect_timer = None
-        self.disconnect()
-        try:
-            import shutil
-            if self._download_dir.exists():
-                shutil.rmtree(self._download_dir, ignore_errors=True)
-        except Exception:
-            pass

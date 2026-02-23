@@ -58,8 +58,8 @@ Supports most common video formats including:
 
 ## Requirements
 
-- **VLC Media Player:** Must be installed on your system (the player uses the VLC engine).
-  - Download: [videolan.org](https://www.videolan.org/vlc/)
+- **MPV Player Engine:** The app now bundles or uses the `libmpv` engine natively.
+  - On Windows, the required `mpv-1.dll` should be placed in the `lib/` directory next to the executable or script.
 
 ## Watch Together — Self-Hosted Server
 
@@ -98,6 +98,21 @@ All shortcuts can be customized in Settings → Preferences (Ctrl+,)
 | **Ctrl+O** | Open Folder |
 | **Ctrl+Q** | Quit |
 
+## Project Structure
+
+```
+random_clip_player.py   # Main application entry point
+session_client.py       # Watch Together networking module
+requirements.txt        # Python dependencies
+build.bat               # Nuitka build script
+RandomClipPlayer.spec   # PyInstaller spec (alternative build)
+pyrightconfig.json      # Type checker config
+lib/                    # Bundled mpv-1.dll
+server/                 # Watch Together server (FastAPI + Docker)
+docs/                   # Dev docs (implementation plan, MPV notes)
+scripts/                # Dev/migration scripts
+```
+
 ## Building from Source
 
 1. Clone the repository
@@ -105,13 +120,19 @@ All shortcuts can be customized in Settings → Preferences (Ctrl+,)
    ```bash
    pip install -r requirements.txt
    ```
-3. Run the build:
+3. Ensure `lib/mpv-1.dll` is present (or run `python scripts/download_mpv.py`)
+4. **Run from source:**
    ```bash
-   pyinstaller --clean --onefile --windowed --name "RandomClipPlayer" random_clip_player.py
+   python random_clip_player.py
+   python random_clip_player.py --debug   # verbose logging
    ```
-4. Debug mode (optional):
+5. **Build executable (Nuitka):**
    ```bash
-   RandomClipPlayer.exe --debug
+   build.bat
+   ```
+   Or with PyInstaller:
+   ```bash
+   pyinstaller RandomClipPlayer.spec
    ```
 
 ## Changelog

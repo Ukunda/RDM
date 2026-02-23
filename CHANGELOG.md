@@ -12,6 +12,7 @@
 ### Improved
 - **Code Quality:** Resolved all Pylance/type-checker errors across the codebase.
   - Added null-safety guards for Optional returns (`menuBar()`, `centralWidget()`, `clipboard()`, VLC instance).
+  - Migrated core playback engine from `python-vlc` to `python-mpv` (`libmpv`) for better performance and stability without a system-wide installation requirement.
   - Fixed `SessionClient` possibly-unbound errors from conditional import.
   - Fixed argument type mismatches (`config.get()` returning Optional passed to typed parameters).
   - Fixed `DraggableButtonBar.layout` shadowing `QWidget.layout()` (renamed to `_layout`).

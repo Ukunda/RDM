@@ -5,7 +5,7 @@ a = Analysis(
     ['random_clip_player.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('lib', 'lib')],
     hiddenimports=['session_client'],
     hookspath=[],
     hooksconfig={},

@@ -1,5 +1,5 @@
-PyQt5>=5.15.0
-python-vlc>=3.0.0
+PySide6
+python-mpv>=1.0.1
 pyinstaller>=5.0.0
 
 # Watch Together (Session Mode)

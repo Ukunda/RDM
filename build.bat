@@ -14,12 +14,17 @@ if errorlevel 1 (
 )
 
 echo [1/3] Installing required packages...
-pip install PyQt5 python-vlc requests websocket-client pyinstaller
+pip install PySide6 python-mpv requests websocket-client Nuitka
 
 echo.
-echo [2/3] Creating executable...
-REM --windowed hides the console in release builds. Debug mode (--debug) is CLI-only.
-pyinstaller --onefile --windowed --name "RandomClipPlayer" --icon=NONE --hidden-import=session_client random_clip_player.py
+echo [2/3] Creating executable with Nuitka...
+REM --windows-disable-console hides the console in release builds.
+python -m nuitka --standalone --onefile ^
+    --windows-disable-console ^
+    --include-data-dir=lib=lib ^
+    --enable-plugin=pyside6 ^
+    --output-filename=RandomClipPlayer.exe ^
+    random_clip_player.py
 
 echo.
 echo [3/3] Build complete!
@@ -28,8 +33,5 @@ echo ========================================
 echo   Executable location:
 echo   dist\RandomClipPlayer.exe
 echo ========================================
-echo.
-echo NOTE: Make sure VLC media player is installed on your system!
-echo       Download from: https://www.videolan.org/vlc/
 echo.
 pause

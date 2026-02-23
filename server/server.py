@@ -317,6 +317,12 @@ async def upload_video(
 
     room.touch()
 
+    # Validate file extension
+    ALLOWED_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpeg', '.mpg', '.3gp', '.ts', '.mts'}
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported file type: {ext}")
+
     # Generate a unique video ID
     video_id = secrets.token_hex(8)
     safe_filename = f"{video_id}_{file.filename}"
