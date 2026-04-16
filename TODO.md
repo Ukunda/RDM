@@ -30,12 +30,18 @@ Lösung:
 
   Client (Gast):
   - Signal position_heartbeat(float, float) auf SessionSignals
-  - Handler _on_position_heartbeat(position, speed):
+  - Handler _on_position_heartbeat(host_pos, host_speed):
+    - RTT-Kompensation: host_pos += (last_ping_ms / 2000.0) * host_speed
+      (Heartbeat reiste ~halbe RTT durchs Netz, Host ist inzwischen weiter.
+      Ohne Kompensation würde der Gast bei 200ms Ping dauerhaft ~0.1s
+      "korrigieren" obwohl er eigentlich synchron ist. ping_result Signal
+      existiert bereits und wird in _last_ping_ms gespeichert.)
     - Eigene Position per self.player.time_pos lesen
-    - drift = abs(eigene_pos - host_pos)
-    - drift > 2.0s → _ignore_remote=True, player.seek(host_pos), _ignore_remote=False
+    - drift = abs(eigene_pos - compensated_host_pos)
+    - drift > 2.0s → _ignore_remote=True, player.seek(compensated_host_pos),
+      _ignore_remote=False
     - drift > 5.0s → zusätzlich kurze Statusmeldung "🔄 Sync korrigiert"
-    - drift < 0.5s → nichts tun (normaler Jitter)
+    - drift < 0.5s → nichts tun (normaler Jitter + Messungenauigkeit)
     - Speed-Abgleich: wenn host_speed != player.speed → korrigieren
 
   Bekannte Einschränkung: Heartbeat kompensiert Drift, VERHINDERT ihn nicht.
@@ -80,48 +86,69 @@ Probleme (einzeln adressiert):
   (d) _playing_remote_clip Bug
   Problem: _on_all_ready setzt _playing_remote_clip=True auch für den User
   der den Clip SELBST geteilt hat. Folge: Like/Dislike für eigenen Clip disabled.
-  Fix: _on_all_ready prüft ob video_id in client._videos mit local_path existiert
-  (= wir haben den Clip hochgeladen). Wenn ja → _playing_remote_clip=False.
+  Fix: Server fügt "uploaded_by" in die all_ready Message ein (Room.videos[video_id]
+  ["uploaded_by"] existiert bereits). Client prüft uploaded_by == own user_id.
+  Wenn ja → _playing_remote_clip=False. Kein Raten über Client-Cache-State nötig.
 
 ═══════════════════════════════════════════════
   3 — SESSION STATE CONSOLIDATION  (🟡)
 ═══════════════════════════════════════════════
 
-Problem: 6 Booleans in VideoPlayer + 3 State-Felder in SessionPanel. Kein
-zentraler Überblick was die Session gerade tut. Bugs entstehen durch
-widersprüchliche Flag-Kombinationen.
+Problem: _session_uploading, _pending_sync_video_id, _pending_prepare_video_id
+sind drei separate Felder die eine einzige Sache beschreiben: "In welcher Phase
+ist der aktuelle Clip-Wechsel?" Dazu kommt _session_uploading das bei Disconnect
+hängen bleiben kann (→ User locked out).
 
-Ansatz: KEIN flaches Enum (die Dimensionen sind orthogonal). Stattdessen
-drei getrennte, typisierte State-Felder in einem SessionState-Objekt:
+Ansatz: Ein Enum für die Workflow-Phase + ein separater Prefetch-State.
+Kein Compound-State aus 3 Enums (over-engineering für die tatsächliche Komplexität).
 
-  @dataclass
-  class SessionState:
-      connection: ConnectionState = DISCONNECTED  # DISCONNECTED | CONNECTING | CONNECTED
-      transfer: TransferState = IDLE              # IDLE | UPLOADING | DOWNLOADING | PREFETCHING
-      sync: SyncState = NONE                      # NONE | WAITING_READY | SYNCING | PLAYING
+  class SessionPhase(Enum):
+      IDLE = "idle"                # Nichts passiert / normale Wiedergabe
+      UPLOADING = "uploading"      # Wir laden einen Clip hoch
+      DOWNLOADING = "downloading"  # Wir laden einen Clip herunter (prepare_video)
+      READY_WAIT = "ready_wait"    # Video geladen, warten auf all_ready
+      SYNCING = "syncing"          # Join-in-progress: warten auf Sync-Video
 
-  Regeln (validated per Property-Setter):
-  - transfer=UPLOADING nur wenn connection=CONNECTED
-  - sync=WAITING_READY nur wenn connection=CONNECTED und transfer != UPLOADING
-  - PREFETCHING kann parallel zu PLAYING laufen (das ist der Punkt)
+  class PrefetchState(Enum):
+      NONE = "none"
+      FETCHING = "fetching"        # Prefetch-Download läuft
+      CACHED = "cached"            # Prefetch-Video bereit
 
-  Ersetzt:
-  - _session_uploading → state.transfer == UPLOADING
-  - _playing_remote_clip → bleibt separat (ist kein State, sondern Clip-Metadata)
-  - _session_shared_pool → bleibt separat (ist ein Setting, kein State)
-  - _session_active → state.connection != DISCONNECTED
-  - _pending_sync_video_id → state.sync == SYNCING + video_id Property
-  - _pending_prepare_video_id → state.sync == WAITING_READY + video_id Property
+  Auf VideoPlayer/SessionPanel:
+  - self._session_phase = SessionPhase.IDLE
+  - self._phase_video_id: Optional[str] = None  (welches Video zur Phase gehört)
+  - self._prefetch = PrefetchState.NONE
+  - self._prefetch_video_id: Optional[str] = None
 
-  _ignore_remote bleibt unverändert — es ist ein synchroner Echo-Guard,
-  kein State. Das zu erfassen wäre over-engineering.
+  Ersetzt direkt:
+  - _session_uploading      → _session_phase == UPLOADING
+  - _pending_prepare_video_id → _session_phase == DOWNLOADING, _phase_video_id
+  - _pending_sync_video_id    → _session_phase == SYNCING, _phase_video_id
+  - _pending_sync_state       → bleibt (ist Daten, kein State)
 
-  Implementierung:
-  - SessionState Klasse mit Validierung (~40 LOC)
-  - Property self.session_state auf VideoPlayer
-  - Schrittweise Migration: Alte Flags als Properties die auf session_state delegieren
-    (Backward-compatible, kein Big-Bang-Refactoring)
-  - Debug-Logging bei State-Transitions (nur wenn --debug)
+  Bleibt unverändert (mit Begründung):
+  - _ignore_remote: Synchroner Echo-Guard, wird im selben Callstack gesetzt
+    und gelöscht. Kein State, kein Lifecycle.
+  - _session_shared_pool: Setting, kein Workflow-State.
+  - _session_active: UI-Visibility-Flag, orthogonal zum Workflow.
+  - _playing_remote_clip: Clip-Eigenschaft, nicht Workflow-Phase.
+
+  Validierung (in Phase-Setter):
+  - UPLOADING/DOWNLOADING/SYNCING → nur aus IDLE heraus möglich
+  - IDLE → von überall (reset)
+  - _phase_video_id wird bei IDLE automatisch auf None gesetzt
+  - Debug-Log bei jeder Transition (nur wenn --debug)
+
+  Fehler-Recovery:
+  - _show_disconnected: _session_phase = IDLE (räumt alles auf)
+  - _on_error: _session_phase = IDLE
+  - Timeout: falls Phase != IDLE für >60s ohne Fortschritt → force IDLE + Warnung
+    (fängt den Fall ab dass _session_uploading bei Disconnect hängen bleibt)
+
+  Migration: Alte Properties als Wrapper:
+  @property
+  def _session_uploading(self): return self._session_phase == SessionPhase.UPLOADING
+  Schrittweise umstellen, alter Code bricht nicht.
 
 ═══════════════════════════════════════════════
   4 — RESUMABLE CHUNKED UPLOADS  (🟡)
@@ -153,14 +180,17 @@ Client hat keine Resume-Möglichkeit.
   Client-Änderungen (session_client.py):
   - _upload_thread Rework:
     1. POST /init → upload_id
-    2. File in CHUNK_SIZE (2MB) Blöcke splitten
+    2. File in CHUNK_SIZE (5MB) Blöcke splitten
+       (5MB = 100 Requests für 500MB. Bei 2MB wären es 250 — unnötiger
+       HTTP-Overhead pro Chunk. Bei 10MB wäre die Resume-Granularität zu grob.
+       5MB ist der Sweet Spot.)
     3. For each chunk: PUT /chunk/{i}, bei Fehler → retry 3x mit 2s Delay
     4. Progress: Bestehende upload_progress Signal (bytes_sent, total)
     5. POST /complete → video_id
     6. send_play_video(video_id) wie bisher
   - Resume: Bei ConnectionError → GET /status → letzter successful Index →
     Loop ab Index+1 fortsetzen (kein erneuter /init Call)
-  - Config: chunk_size (default 2MB, nicht user-facing)
+  - CHUNK_SIZE als Konstante in session_client.py (nicht user-facing)
 
   Kein Chunked Download nötig: Server liefert StreamingResponse, Client liest
   iter_content(256KB). Bei Abbruch reicht ein neuer GET (Server hat die Datei
@@ -188,71 +218,91 @@ Client hat keine Resume-Möglichkeit.
     "Überspringen" → skipped_version=tag in config, nie wieder für diese Version
   - Prüfung: if tag == config.skipped_version → kein Dialog
 
-  Update-Mechanismus (Windows-spezifisch):
+  Update-Mechanismus (Windows):
+  - Windows erlaubt os.rename() auf eine laufende .exe (nur delete/overwrite
+    ist gesperrt). Kein Batch-Script nötig.
   - Download: .exe aus release assets[0].browser_download_url → %TEMP%\rdm_update.exe
   - Progress-Dialog (QProgressDialog) mit Download-Fortschritt
-  - Nach Download: Schreibe updater.bat nach %TEMP%:
-      @echo off
-      timeout /t 2 /nobreak > nul
-      move /y "%TEMP%\rdm_update.exe" "{aktueller_exe_pfad}"
-      start "" "{aktueller_exe_pfad}"
-      del "%~f0"
-  - Starte updater.bat (detached, CREATE_NO_WINDOW)
-  - App beendet sich (sys.exit)
-  - Batch-Script: wartet 2s (Prozess-Exit), überschreibt, startet neu, löscht sich
+  - Nach Download:
+    1. os.rename(current_exe, current_exe + ".old")  — laufende .exe umbenennen
+    2. shutil.move(%TEMP%\rdm_update.exe, current_exe)  — neue .exe an alten Platz
+    3. subprocess.Popen([current_exe], creationflags=DETACHED_PROCESS)  — neue starten
+    4. sys.exit(0)  — alte beenden
+  - Beim nächsten Start: if exists(exe_path + ".old"): os.remove(exe_path + ".old")
+  - Rollback: Falls Schritt 3 fehlschlägt → os.rename(current_exe + ".old", current_exe)
+    und Fehlermeldung anzeigen. User hat weiterhin die alte Version.
 
-  Sicherheit:
-  - HTTPS-only für Download
-  - Optionale Checksum-Verifikation (SHA256 in Release-Notes oder als .sha256 Asset)
+  Sonderfall: Wenn App via python random_clip_player.py läuft (kein .exe):
+  - Update-Check zeigt "Neue Version v1.x verfügbar" + Link zum GitHub Release
+  - Kein Auto-Download (macht keinen Sinn für .py-Ausführung)
 
 ═══════════════════════════════════════════════
-  6 — PREFETCH NÄCHSTES VIDEO  (🟡→🔴)
+  6 — PREFETCH NÄCHSTES VIDEO  (🟡)
 ═══════════════════════════════════════════════
 
 Problem: Jeder Clip-Wechsel in Sessions hat 5-30s Wartezeit
 (Upload + Download + Ready-Sync). Bei großen Dateien unerträglich.
 
-Ansatz: Spekulativer Prefetch des NÄCHSTEN Clips während der aktuelle läuft.
-Kein Queue-UI, kein Server-Queue-State, kein Drag-to-Reorder.
+Kernidee: Das bestehende Ready-Sync + Download-Cache löst Prefetch bereits —
+wenn Clients ein Video schon heruntergeladen haben, schlägt _download_thread
+sofort im Cache an (get_local_video_path) und emittiert video_ready instant.
+Prefetch muss also nur dafür sorgen, dass das Video VOR dem play_video-Aufruf
+auf allen Clients liegt. Kein neuer Server-State, kein neues Protokoll.
 
-  Neues Konzept: "Prefetch-Slot"
-  - Client hat einen Prefetch-Slot: {video_id, local_path} oder None
-  - Server hat pro Room: prefetch_video = {video_id, ready_users: set} oder None
+  Neues WS-Event (2 Stück):
+  - "request_prefetch" (Client → Server): Identisch zu request_random, aber
+    der Provider uploaded das Video ohne play_video zu senden.
+  - "prefetch_available" (Server → alle): {video_id, filename}
+    Clients starten Background-Download. Kein Ready-Sync, kein Status-Update.
 
-  Flow — Prefetch einleiten (nach all_ready des aktuellen Clips):
-  1. Host wartet 3s (lässt User erst den Clip sehen)
-  2. Host sendet: {"type": "request_prefetch"} (wie request_random, aber non-blocking)
-  3. Server wählt Provider (gleiche Logik wie request_random, mit Timeout/Retry aus Fix #2)
-  4. Provider erhält: {"type": "provide_prefetch_clip"} → wählt nächsten Clip,
-     uploaded via bestehenden Upload-Endpoint
-  5. Provider sendet: {"type": "prefetch_ready", "video_id": id}
-  6. Server setzt room.prefetch_video = {video_id, ready_users: {provider_uid}}
-  7. Server broadcasts: {"type": "prefetch_available", "video_id": id, "filename": name}
-  8. Andere Clients downloaden im Hintergrund (state.transfer = PREFETCHING)
-  9. Nach Download: Client sendet {"type": "prefetch_downloaded", "video_id": id}
-  10. Server trackt ready_users. Wenn alle ready → room.prefetch_video.all_ready = True
+  Flow:
+  1. all_ready für aktuellen Clip → Host startet 3s QTimer
+  2. Timer feuert → Host sendet {"type": "request_prefetch"}
+  3. Server: Gleiche Provider-Auswahl wie request_random (mit Timeout/Retry aus #2)
+  4. Provider: Wählt nächsten Clip aus play_queue, uploaded via existierendem
+     POST /upload. SENDET KEIN play_video. Stattdessen sendet Provider:
+     {"type": "prefetch_uploaded", "video_id": id}
+  5. Server: Broadcasts {"type": "prefetch_available", "video_id": id, "filename": name}
+  6. Alle Clients (inkl. Host): download_video(video_id) im Hintergrund.
+     Kein Overlay, kein Status-Update (es ist spekulativ, User soll nichts merken).
+     Download landet in _videos Cache wie bei normalem Download.
+  7. Host speichert: _prefetch_video_id = video_id
 
-  Flow — Prefetch nutzen (wenn User nächsten Clip will):
-  1. Host ruft play_random_clip → prüft prefetch_slot
-  2. Wenn prefetch_slot vorhanden UND video_id == room.prefetch_video:
-     - Host sendet {"type": "play_prefetched", "video_id": id}
-     - Server: Wenn alle prefetch_downloaded → sofort all_ready (skip Download-Phase)
-     - Server: Wenn nicht alle ready → normaler ready-sync (die die noch downloaden
-       müssen warten, aber die meisten haben es schon)
-  3. Wenn kein Prefetch oder Prefetch nicht ready → normaler Flow (upload + ready-sync)
+  Flow — Prefetch nutzen:
+  1. Host ruft play_random_clip:
+     - Wenn _prefetch_video_id vorhanden:
+       Host's _session_auto_share() erkennt: Video ist bereits uploaded.
+       Stattdessen: client.send_play_video(_prefetch_video_id) direkt
+       (skip Upload, Video liegt schon auf dem Server).
+     - Server startet normalen Ready-Sync (prepare_video → download → ready)
+     - ABER: _download_thread bei jedem Client → get_local_video_path → Cache hit
+       → sofort video_ready → sofort ready → all_ready in <1s.
+     - _prefetch_video_id = None
+  2. Wenn kein Prefetch vorhanden → normaler Flow (Upload + Download + Ready-Sync)
 
-  Client State:
-  - _prefetch_slot: Optional[dict] = None  # {"video_id": str, "local_path": str}
-  - transfer State: PREFETCHING (parallel zu PLAYING erlaubt, siehe State Consolidation)
-  - SessionPanel: Kleiner Indikator "⏳ Nächster Clip wird vorbereitet…" (kein Overlay)
+  Client State (minimal):
+  - _prefetch_video_id: Optional[str] = None
+  - _prefetch_state = PrefetchState.NONE / FETCHING / CACHED (aus #3)
+  - Cleared bei: disconnect, stop, manueller Clip-Wechsel
 
   Edge Cases:
-  - User skipped bevor Prefetch fertig → Prefetch verwerfen, normaler Flow
-  - Provider disconnected während Prefetch → Prefetch abbrechen, kein Fehler (war optional)
-  - Prefetch-Clip == aktueller Clip (Provider hat nur wenige) → ignorieren
+  - Prefetch-Download nicht fertig wenn User skippt → normaler Flow, unvollständiger
+    Download wird von neuem _download_thread für selbe video_id abgeschlossen
+    (oder gestartet falls noch nicht gestartet)
+  - Provider disconnect während Upload → Prefetch silently abgebrochen.
+    Kein Fehler nötig (Prefetch ist optional, Fallback ist der normale Flow).
+  - Room mit nur 1 User → kein Prefetch (User ist selbst Provider + Consumer,
+    Upload wäre Verschwendung. Lokale Clips sind eh instant.)
+  - Prefetch-Video passt nicht mehr (Provider wechselt) → egal, Video liegt
+    trotzdem im Cache. Worst case: unnötig heruntergeladen.
 
-  Abhängigkeit: Pool Robustheit (#2) muss fertig sein (Timeout/Retry-Logik)
-  Profitiert von: State Consolidation (#3, PREFETCHING Dimension)
+  Warum kein extra Server-State:
+  - Server muss nicht wissen wer den Prefetch hat. Wenn play_video kommt,
+    ist es ein normaler Ready-Sync. Der Speed-Gewinn kommt ausschließlich
+    vom Client-Cache-Hit. Server-Logik bleibt identisch.
+
+  Abhängigkeit: Pool Robustheit (#2) für Timeout/Retry.
+  Profitiert von: State Consolidation (#3) für PrefetchState Enum.
 
 ═══════════════════════════════════════════════
   7 — MODUL-SPLIT  (🟡 Housekeeping)
@@ -293,17 +343,14 @@ random_clip_player.py ist bei 3500+ Zeilen. Wartbarkeit leidet.
 🔲 Folder-Scan: rglob("*") → gezielte Extension-Globs (*.mp4, *.mkv, etc.)
    Nur messbar bei Verzeichnissen mit vielen Nicht-Video-Dateien.
 
-🔲 _playing_remote_clip Fix (Teil von #2d, aber auch standalone machbar)
-   _on_all_ready: check ob video_id eigener Upload war → False statt True.
-
 ═══════════════════════════════════════════════
   REIHENFOLGE
 ═══════════════════════════════════════════════
 
   1. 🐛 Desync-Heartbeat              (🟢 ~60 LOC, höchster UX-Impact/LOC)
-  2. 🐛 Shared Pool Robustheit        (🟡 Timeout, Clip-Count, Exhaustion-Tracking)
-  3. 🔲 Session State Consolidation    (🟡 Basis für Prefetch, reduziert Flag-Chaos)
+  2. 🐛 Shared Pool Robustheit        (🟡 Timeout, Clip-Count, Exhaustion, Remote-Clip-Fix)
+  3. 🔲 Session State Consolidation    (🟡 SessionPhase Enum, Basis für Prefetch)
   4. 🔲 Auto-Updater                   (🟡 eigenständig, kein Risiko)
-  5. 🔲 Resumable Uploads              (🟡 Chunked + Resume)
-  6. 🔲 Prefetch nächstes Video        (🔴 nach #2 + #3, größtes UX-Feature)
+  5. 🔲 Resumable Uploads              (🟡 Chunked + Resume, 5MB Chunks)
+  6. 🔲 Prefetch nächstes Video        (🟡 nutzt bestehenden Cache + Ready-Sync)
   7. 🔲 Modul-Split                    (🟡 nach Feature-Freeze)
