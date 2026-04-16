@@ -79,6 +79,9 @@ class SessionSignals(QObject):
     # Ping
     ping_result = Signal(int)                   # (latency_ms)
 
+    # Heartbeat — host position sync for drift correction
+    position_heartbeat = Signal(float, float)   # (position, speed)
+
 
 # ============================================================================
 # Session Client
@@ -275,6 +278,10 @@ class SessionClient:
         """Send a ping to measure round-trip latency."""
         self._ping_sent_at = time.monotonic()
         self._send({"type": "ping"})
+
+    def send_position_heartbeat(self, position: float, speed: float):
+        """Send current playback position for drift correction (host only)."""
+        self._send({"type": "position_heartbeat", "position": position, "speed": speed})
 
     def start_ping_loop(self, interval: float = 5.0):
         """Start a repeating ping every `interval` seconds."""
@@ -606,6 +613,12 @@ class SessionClient:
                     latency_ms = int((time.monotonic() - self._ping_sent_at) * 1000)
                     self._ping_sent_at = 0.0
                     self.signals.ping_result.emit(latency_ms)
+
+            elif msg_type == "position_heartbeat":
+                self.signals.position_heartbeat.emit(
+                    data.get("position", 0.0),
+                    data.get("speed", 1.0),
+                )
 
             elif msg_type == "provide_random_clip":
                 # Server picked us to share a random clip

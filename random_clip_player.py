@@ -1846,6 +1846,7 @@ class SessionPanel(QFrame):
             c.remote_seek.connect(self._on_activity_seek)
             c.remote_speed.connect(self._on_activity_speed)
             c.remote_play_video.connect(self._on_activity_play_video)
+            c.position_heartbeat.connect(self._player._on_position_heartbeat)
 
     # ---- Handlers ----
 
@@ -2018,6 +2019,7 @@ class SessionPanel(QFrame):
             self._player._update_session_dot(False)
             self._player._session_shared_pool = False
             self._player._session_uploading = False
+            self._player._heartbeat_timer.stop()
 
     def _on_upload_progress(self, sent, total):
         if total > 0:
@@ -2151,6 +2153,7 @@ class SessionPanel(QFrame):
             self._player.play_btn.setText("⏸  Pause")
             self._player._apply_current_speed()
             self._player._ignore_remote = False
+            self._player._heartbeat_timer.start()
 
     def _on_ready_progress(self, ready_count, total):
         """Show how many users are ready."""
@@ -2158,6 +2161,8 @@ class SessionPanel(QFrame):
 
     def _on_ping_result(self, latency_ms):
         """Update ping display with color-coded latency."""
+        if self._player:
+            self._player._last_ping_ms = latency_ms
         if latency_ms < 80:
             color = COLORS['accent_green']
             icon = "📶"
@@ -2250,6 +2255,10 @@ class VideoPlayer(QMainWindow):
         self._session_shared_pool = False  # Shared random pool mode
         self._playing_remote_clip = False  # True when current clip came from another user
         self._session_uploading = False    # True while uploading a clip to session
+        self._last_ping_ms = 0             # Latest RTT for heartbeat compensation
+        self._heartbeat_timer = QTimer()
+        self._heartbeat_timer.setInterval(5000)
+        self._heartbeat_timer.timeout.connect(self._send_position_heartbeat)
         self._is_fullscreen = False            # Fullscreen state
         
         # Setup UI (must come before MPV init so video_frame exists)
@@ -3169,6 +3178,7 @@ class VideoPlayer(QMainWindow):
         self.duration_label.setText(self._format_time(int(duration * 1000)))
         
     def _on_video_finished(self):
+        self._heartbeat_timer.stop()
         if self.autoplay_enabled:
             # In a session, only the host triggers autoplay
             client = self._get_session_client()
@@ -3634,6 +3644,7 @@ class VideoPlayer(QMainWindow):
         if client and self.player:
             pos = float(self.player.time_pos or 0.0)
             client.send_play(pos)
+            self._heartbeat_timer.start()
 
     def _session_send_pause(self):
         """Notify the session that we pressed pause."""
@@ -3643,6 +3654,7 @@ class VideoPlayer(QMainWindow):
         if client and self.player:
             pos = float(self.player.time_pos or 0.0)
             client.send_pause(pos)
+            self._heartbeat_timer.stop()
 
     def _session_send_seek(self, position):
         """Notify the session that we seeked."""
@@ -3651,6 +3663,8 @@ class VideoPlayer(QMainWindow):
         client = self._get_session_client()
         if client:
             client.send_seek(position)
+            if self._heartbeat_timer.isActive():
+                self._heartbeat_timer.start()  # Reset to full 5s interval
 
     def _session_send_speed(self, speed):
         """Notify the session of speed change."""
@@ -3677,6 +3691,7 @@ class VideoPlayer(QMainWindow):
         self.status_label.setText(f"▶ {username} pressed play")
         QTimer.singleShot(2000, self._update_status_bar)
         self._ignore_remote = False
+        self._heartbeat_timer.start()  # Resume heartbeat on unpause
 
     def _on_remote_pause(self, position, username):
         """Another user pressed pause."""
@@ -3690,6 +3705,7 @@ class VideoPlayer(QMainWindow):
         self.status_label.setText(f"⏸ {username} paused")
         QTimer.singleShot(2000, self._update_status_bar)
         self._ignore_remote = False
+        self._heartbeat_timer.stop()
 
     def _on_remote_seek(self, position, username):
         """Another user seeked."""
@@ -3700,6 +3716,8 @@ class VideoPlayer(QMainWindow):
         self.status_label.setText(f"⏩ {username} seeked")
         QTimer.singleShot(2000, self._update_status_bar)
         self._ignore_remote = False
+        if self._heartbeat_timer.isActive():
+            self._heartbeat_timer.start()  # Reset to full 5s interval
 
     def _on_remote_speed(self, speed, username):
         """Another user changed speed."""
@@ -3711,6 +3729,52 @@ class VideoPlayer(QMainWindow):
         self.status_label.setText(f"Speed: {speed}x by {username}")
         QTimer.singleShot(2000, self._update_status_bar)
         self._ignore_remote = False
+
+    # ---- Heartbeat (desync correction) ----
+
+    def _send_position_heartbeat(self):
+        """Periodically send current position to peers (host only)."""
+        client = self._get_session_client()
+        if not client or not client.is_host:
+            return
+        if not self.player or self.player.pause:
+            return
+        pos = self.player.time_pos
+        if pos is None:
+            return
+        client.send_position_heartbeat(float(pos), float(self.player.speed or 1.0))
+
+    def _on_position_heartbeat(self, host_pos, host_speed):
+        """Received host position — correct drift if needed (guest only)."""
+        client = self._get_session_client()
+        if not client or client.is_host:
+            return  # Host doesn't correct to itself
+        if not self.player or self.player.pause:
+            return
+        my_pos = self.player.time_pos
+        if my_pos is None:
+            return
+        # RTT compensation: host moved forward during network travel (~half RTT)
+        compensated = host_pos + (self._last_ping_ms / 2000.0) * host_speed
+        drift = abs(float(my_pos) - compensated)
+        if drift < 0.5:
+            pass  # Normal jitter
+        elif drift <= 5.0:
+            self._ignore_remote = True
+            self.player.seek(compensated, reference='absolute')
+            self._ignore_remote = False
+        else:
+            self._ignore_remote = True
+            self.player.seek(compensated, reference='absolute')
+            self._ignore_remote = False
+            self.status_label.setText("🔄 Sync korrigiert")
+            QTimer.singleShot(2000, self._update_status_bar)
+        # Speed mismatch correction
+        if host_speed != self.player.speed:
+            self._ignore_remote = True
+            self.player.speed = host_speed
+            self.slow_mo_btn.set_speed(host_speed)
+            self._ignore_remote = False
 
     def _on_remote_play_video(self, video_id, filename, username):
         """Another user wants to play a video — download it."""

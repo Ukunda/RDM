@@ -749,6 +749,13 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
 
+            elif msg_type == "position_heartbeat":
+                await broadcast(room, {
+                    "type": "position_heartbeat",
+                    "position": data.get("position", 0.0),
+                    "speed": data.get("speed", 1.0),
+                }, exclude_id=user_id)
+
     except WebSocketDisconnect:
         pass
     except asyncio.TimeoutError:
