@@ -22,7 +22,11 @@ Lösung:
   - QTimer alle 5s → _send_position_heartbeat()
   - Sendet nur wenn: player existiert, nicht paused, in Session, _ignore_remote False
   - WS: {"type": "position_heartbeat", "position": float, "speed": float}
-  - Timer starten bei all_ready, stoppen bei pause/disconnect/stop
+  - Timer starten bei all_ready UND bei unpause, stoppen bei pause/disconnect/stop
+  - Nach einem Seek: Timer resetten (restart mit vollem 5s Intervall).
+    Ohne Reset könnte ein Heartbeat mit der alten Position feuern bevor der
+    Seek-Event den Gast erreicht → Gast korrigiert zur alten Position,
+    dann kommt der Seek → sichtbarer Glitch.
 
   Server:
   - "position_heartbeat" → broadcast an alle AUSSER Sender (wie play/pause/seek)
@@ -34,8 +38,9 @@ Lösung:
     - RTT-Kompensation: host_pos += (last_ping_ms / 2000.0) * host_speed
       (Heartbeat reiste ~halbe RTT durchs Netz, Host ist inzwischen weiter.
       Ohne Kompensation würde der Gast bei 200ms Ping dauerhaft ~0.1s
-      "korrigieren" obwohl er eigentlich synchron ist. ping_result Signal
-      existiert bereits und wird in _last_ping_ms gespeichert.)
+      "korrigieren" obwohl er eigentlich synchron ist.)
+    - Voraussetzung: _on_ping_result muss latency_ms in self._last_ping_ms
+      speichern (aktuell wird es nur ins Label geschrieben, nicht gespeichert).
     - Eigene Position per self.player.time_pos lesen
     - drift = abs(eigene_pos - compensated_host_pos)
     - drift > 2.0s → _ignore_remote=True, player.seek(compensated_host_pos),
@@ -342,6 +347,10 @@ random_clip_player.py ist bei 3500+ Zeilen. Wartbarkeit leidet.
 
 🔲 Folder-Scan: rglob("*") → gezielte Extension-Globs (*.mp4, *.mkv, etc.)
    Nur messbar bei Verzeichnissen mit vielen Nicht-Video-Dateien.
+
+🔲 Server: Doppelte Zeile entfernen
+   server.py L732-733: `target = room.users.get(target_uid)` steht zweimal.
+   Harmlos, aber sollte bereinigt werden.
 
 ═══════════════════════════════════════════════
   REIHENFOLGE
