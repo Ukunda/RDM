@@ -92,6 +92,7 @@ class Room:
     pending_video: Optional[str] = None                  # video_id waiting for all users to be ready
     ready_users: set = field(default_factory=set)         # user_ids that reported ready for pending_video
     pending_random_request: Optional[dict] = None        # {target_uid, requester_uid, tried: []}
+    pending_prefetch_request: Optional[dict] = None      # {target_uid, tried: []}
     pending_uploads: dict = field(default_factory=dict)  # upload_id -> chunked upload metadata
     playback_state: dict = field(default_factory=lambda: {
         "playing": False,
@@ -682,6 +683,35 @@ async def _ready_timeout(room: Room, video_id: str, timeout: float):
         })
 
 
+async def _prefetch_request_timeout(room: Room, target_uid: str, tried: list):
+    """Timeout for prefetch request — retry silently or give up."""
+    await asyncio.sleep(10.0)
+    req = room.pending_prefetch_request
+    if not req or req.get("target_uid") != target_uid:
+        return  # Fulfilled or cancelled
+    tried.append(target_uid)
+    if len(tried) >= 3:
+        room.pending_prefetch_request = None
+        return  # Silent failure — prefetch is optional
+    eligible = [
+        uid for uid, info in room.pool_opted_in.items()
+        if isinstance(info, dict) and info.get("opted_in") and info.get("count", 0) > 0
+        and uid in room.users and uid not in tried and not info.get("exhausted")
+    ]
+    if not eligible:
+        room.pending_prefetch_request = None
+        return
+    next_uid = random.choice(eligible)
+    room.pending_prefetch_request = {"target_uid": next_uid, "tried": tried}
+    target = room.users.get(next_uid)
+    if target:
+        try:
+            await target.websocket.send_json({"type": "provide_prefetch_clip"})
+        except Exception:
+            pass
+    asyncio.create_task(_prefetch_request_timeout(room, next_uid, tried))
+
+
 async def _random_request_timeout(room: Room, target_uid: str, requester_uid: str, tried: list):
     """Timeout for random clip request — retry with another user or fail."""
     await asyncio.sleep(10.0)
@@ -1042,6 +1072,38 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                 if isinstance(info, dict):
                     info["exhausted"] = True
                 log.info(f"Pool exhausted for '{username}' in room {room_code}")
+
+            elif msg_type == "request_prefetch":
+                # Host asks server to pick a user to prefetch the next clip
+                if room.shared_pool and len(room.users) > 1:
+                    eligible = [
+                        uid for uid, info in room.pool_opted_in.items()
+                        if isinstance(info, dict) and info.get("opted_in") and info.get("count", 0) > 0
+                        and uid in room.users and not info.get("exhausted")
+                    ]
+                    if eligible:
+                        target_uid = random.choice(eligible)
+                        room.pending_prefetch_request = {"target_uid": target_uid, "tried": []}
+                        target = room.users.get(target_uid)
+                        if target:
+                            try:
+                                await target.websocket.send_json({"type": "provide_prefetch_clip"})
+                            except Exception:
+                                pass
+                        asyncio.create_task(_prefetch_request_timeout(room, target_uid, []))
+
+            elif msg_type == "prefetch_uploaded":
+                # Provider finished prefetch upload — broadcast to all clients
+                video_id = data.get("video_id")
+                if video_id and video_id in room.videos:
+                    room.pending_prefetch_request = None
+                    filename = room.videos[video_id]["filename"]
+                    await broadcast(room, {
+                        "type": "prefetch_available",
+                        "video_id": video_id,
+                        "filename": filename,
+                    })
+                    log.info(f"Prefetch available: {filename} in room {room_code}")
 
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})

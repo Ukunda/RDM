@@ -1858,6 +1858,11 @@ class SessionPanel(QFrame):
         if self._player:
             c.pool_reset.connect(self._player._on_pool_reset)
 
+        # Prefetch signals
+        if self._player:
+            c.prefetch_clip_requested.connect(self._player._on_prefetch_clip_requested)
+            c.prefetch_available.connect(self._player._on_prefetch_available)
+
         # Transition lock — server rejected our play_video because one is pending
         c.transition_busy.connect(self._on_transition_busy)
 
@@ -2042,6 +2047,8 @@ class SessionPanel(QFrame):
             self._player._session_shared_pool = False
             self._player._set_session_phase(SessionPhase.IDLE)
             self._player._heartbeat_timer.stop()
+            self._player._prefetch_video_id = None
+            self._player._prefetch_timer.stop()
 
     def _on_upload_progress(self, sent, total):
         if total > 0:
@@ -2181,6 +2188,9 @@ class SessionPanel(QFrame):
             self._player._apply_current_speed()
             self._player._ignore_remote = False
             self._player._heartbeat_timer.start()
+            # Start prefetch timer (host only, shared pool, >1 user)
+            if self._player.is_host_in_session() and self._player._session_shared_pool:
+                self._player._prefetch_timer.start()
 
     def _on_ready_progress(self, ready_count, total):
         """Show how many users are ready."""
@@ -2550,6 +2560,11 @@ class VideoPlayer(QMainWindow):
         self._heartbeat_timer = QTimer()
         self._heartbeat_timer.setInterval(5000)
         self._heartbeat_timer.timeout.connect(self._send_position_heartbeat)
+        self._prefetch_video_id: str | None = None   # video_id of prefetched clip
+        self._prefetch_timer = QTimer()
+        self._prefetch_timer.setInterval(3000)
+        self._prefetch_timer.setSingleShot(True)
+        self._prefetch_timer.timeout.connect(self._request_prefetch)
         self._is_fullscreen = False            # Fullscreen state
         
         # Setup UI (must come before MPV init so video_frame exists)
@@ -3222,6 +3237,14 @@ class VideoPlayer(QMainWindow):
 
         # In session with shared pool: ask server to pick a random user
         if client and self._session_shared_pool:
+            # Use prefetched video if available (already uploaded + downloaded by all)
+            if self._prefetch_video_id:
+                vid = self._prefetch_video_id
+                self._prefetch_video_id = None
+                self._prefetch_timer.stop()
+                client.send_play_video(vid)
+                self.status_label.setText("⚡ Playing prefetched clip...")
+                return
             client.send_request_random()
             self.status_label.setText("🎲 Requesting random clip from pool...")
             return
@@ -3470,6 +3493,7 @@ class VideoPlayer(QMainWindow):
         
     def _on_video_finished(self):
         self._heartbeat_timer.stop()
+        self._prefetch_timer.stop()
         if self.autoplay_enabled:
             # In a session, only the host triggers autoplay
             client = self._get_session_client()
@@ -3966,6 +3990,40 @@ class VideoPlayer(QMainWindow):
         self.status_label.setText("🔄 Pool reset — reshuffled!")
         QTimer.singleShot(2000, self._update_status_bar)
 
+    def _request_prefetch(self):
+        """Host sends a prefetch request to the server after all_ready."""
+        client = self._get_session_client()
+        if client and client.is_host and self._session_shared_pool and len(getattr(client, '_videos', {})) >= 0:
+            client.send_request_prefetch()
+
+    def _on_prefetch_clip_requested(self):
+        """Server picked us to upload a prefetch clip."""
+        if not self.play_queue:
+            self._refresh_queue()
+        if not self.play_queue:
+            return  # Silent — prefetch is optional
+        # Peek at next clip without advancing the queue index
+        next_idx = self.queue_index + 1
+        if next_idx >= len(self.play_queue):
+            return  # Exhausted, don't prefetch
+        clip = self.play_queue[next_idx]
+        if not os.path.exists(clip):
+            return
+        client = self._get_session_client()
+        if client:
+            client.upload_prefetch(clip)
+
+    def _on_prefetch_available(self, video_id: str, filename: str):
+        """A prefetched video is available — download silently in background."""
+        client = self._get_session_client()
+        if not client:
+            return
+        # Store the prefetch video_id for the host to use later
+        if self.is_host_in_session():
+            self._prefetch_video_id = video_id
+        # Download in background (no UI updates — this is speculative)
+        client.download_video(video_id)
+
     def _update_session_dot(self, connected):
         """Update the session menu title with a green/grey dot."""
         if not hasattr(self, '_session_menu') or self._session_menu is None:
@@ -3980,6 +4038,11 @@ class VideoPlayer(QMainWindow):
             if client.is_connected:
                 return client
         return None
+
+    def is_host_in_session(self) -> bool:
+        """True if we are connected to a session and are the host."""
+        client = self._get_session_client()
+        return client is not None and client.is_host
 
     def _session_send_play(self):
         """Notify the session that we pressed play."""

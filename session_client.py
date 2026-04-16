@@ -77,6 +77,10 @@ class SessionSignals(QObject):
     random_failed = Signal(str)                   # (message) — random request failed after retries
     pool_reset = Signal()                         # All users exhausted, reshuffle queues
 
+    # Prefetch — background upload/download of next clip
+    prefetch_clip_requested = Signal()            # Server wants us to upload a prefetch clip
+    prefetch_available = Signal(str, str)          # (video_id, filename) — prefetch ready to download
+
     # Transition lock — server rejected play_video because one is already pending
     transition_busy = Signal(str)                 # (message)
 
@@ -282,6 +286,14 @@ class SessionClient:
         """Tell the server our play queue is exhausted."""
         self._send({"type": "pool_exhausted"})
 
+    def send_request_prefetch(self):
+        """Ask server to pick a user to prefetch the next clip."""
+        self._send({"type": "request_prefetch"})
+
+    def send_prefetch_uploaded(self, video_id: str):
+        """Tell server a prefetch upload is done (don't trigger play_video)."""
+        self._send({"type": "prefetch_uploaded", "video_id": video_id})
+
     def send_ping(self):
         """Send a ping to measure round-trip latency."""
         self._ping_sent_at = time.monotonic()
@@ -367,7 +379,15 @@ class SessionClient:
         """Upload a local video to the server and tell the room to play it."""
         threading.Thread(
             target=self._upload_thread,
-            args=(filepath,),
+            args=(filepath, False),
+            daemon=True,
+        ).start()
+
+    def upload_prefetch(self, filepath: str):
+        """Upload a video for prefetch (no play_video trigger)."""
+        threading.Thread(
+            target=self._upload_thread,
+            args=(filepath, True),
             daemon=True,
         ).start()
 
@@ -651,6 +671,15 @@ class SessionClient:
             elif msg_type == "pool_reset":
                 self.signals.pool_reset.emit()
 
+            elif msg_type == "provide_prefetch_clip":
+                self.signals.prefetch_clip_requested.emit()
+
+            elif msg_type == "prefetch_available":
+                self.signals.prefetch_available.emit(
+                    data.get("video_id", ""),
+                    data.get("filename", ""),
+                )
+
             elif msg_type == "error":
                 self.signals.room_error.emit(data.get("message", "Unknown error"))
 
@@ -690,7 +719,7 @@ class SessionClient:
     # Internal: Upload / Download
     # ====================================================================
 
-    def _upload_thread(self, filepath: str):
+    def _upload_thread(self, filepath: str, prefetch: bool = False):
         """Upload a video file using resumable chunked upload, then tell the room to play it."""
         try:
             if not os.path.exists(filepath):
@@ -798,8 +827,12 @@ class SessionClient:
                 "local_path": filepath,
             }
 
-            # Tell room to play this video (server starts ready-sync)
-            self.send_play_video(video_id)
+            if prefetch:
+                # Prefetch mode: notify server but don't trigger play_video
+                self.send_prefetch_uploaded(video_id)
+            else:
+                # Tell room to play this video (server starts ready-sync)
+                self.send_play_video(video_id)
             self.signals.video_ready.emit(video_id, filepath)
 
         except Exception as e:
