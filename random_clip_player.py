@@ -729,6 +729,133 @@ class StartupDialog(QDialog):
 # Custom Widgets
 # ============================================================================
 
+class TransferOverlay(QFrame):
+    """Semi-transparent overlay shown on the video area during upload/download."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setVisible(False)
+        self._start_time = 0.0
+        self._direction = ""  # "upload" or "download"
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignCenter)
+
+        self._container = QFrame()
+        self._container.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba(13, 17, 23, 200);
+                border: 2px solid {COLORS['accent_blue']};
+                border-radius: 10px;
+                padding: 16px;
+            }}
+        """)
+        container_layout = QVBoxLayout(self._container)
+        container_layout.setSpacing(8)
+
+        self._icon_label = QLabel("⬇")
+        self._icon_label.setAlignment(Qt.AlignCenter)
+        self._icon_label.setStyleSheet(f"color: {COLORS['accent_blue']}; font-size: 28px; background: transparent; border: none;")
+        container_layout.addWidget(self._icon_label)
+
+        self._text_label = QLabel("Downloading…")
+        self._text_label.setAlignment(Qt.AlignCenter)
+        self._text_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px; font-weight: bold; background: transparent; border: none;")
+        container_layout.addWidget(self._text_label)
+
+        self._progress_label = QLabel("")
+        self._progress_label.setAlignment(Qt.AlignCenter)
+        self._progress_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; background: transparent; border: none;")
+        container_layout.addWidget(self._progress_label)
+
+        self._bar = QFrame()
+        self._bar.setFixedHeight(6)
+        self._bar.setStyleSheet(f"background-color: {COLORS['bg_light']}; border-radius: 3px; border: none;")
+        container_layout.addWidget(self._bar)
+
+        self._bar_fill = QFrame(self._bar)
+        self._bar_fill.setFixedHeight(6)
+        self._bar_fill.setStyleSheet(f"background-color: {COLORS['accent_blue']}; border-radius: 3px; border: none;")
+        self._bar_fill.setGeometry(0, 0, 0, 6)
+
+        self._container.setFixedWidth(320)
+        layout.addWidget(self._container)
+
+    def _resize_to_parent(self):
+        if self.parentWidget():
+            self.setGeometry(self.parentWidget().rect())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._resize_to_parent()
+
+    def start(self, direction: str):
+        """Show the overlay for an upload or download."""
+        import time as _time
+        self._direction = direction
+        self._start_time = _time.monotonic()
+        icon = "⬆" if direction == "upload" else "⬇"
+        label = "Uploading…" if direction == "upload" else "Downloading…"
+        color = COLORS['accent_green'] if direction == "upload" else COLORS['accent_blue']
+        self._icon_label.setText(icon)
+        self._icon_label.setStyleSheet(f"color: {color}; font-size: 28px; background: transparent; border: none;")
+        self._text_label.setText(label)
+        self._progress_label.setText("")
+        self._bar_fill.setGeometry(0, 0, 0, 6)
+        self._container.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba(13, 17, 23, 200);
+                border: 2px solid {color};
+                border-radius: 10px;
+                padding: 16px;
+            }}
+        """)
+        self._resize_to_parent()
+        self.setVisible(True)
+        self.raise_()
+
+    def update_progress(self, received: int, total: int):
+        """Update progress bar and text."""
+        import time as _time
+        if total > 0:
+            pct = min(100, int(received / total * 100))
+            bar_width = int(self._bar.width() * pct / 100)
+            self._bar_fill.setGeometry(0, 0, max(0, bar_width), 6)
+
+            # Speed & ETA
+            elapsed = _time.monotonic() - self._start_time
+            speed = received / elapsed if elapsed > 0.5 else 0
+            remaining_bytes = total - received
+            eta = remaining_bytes / speed if speed > 0 else 0
+
+            size_text = f"{self._fmt(received)} / {self._fmt(total)}  ({pct}%)"
+            speed_text = f"{self._fmt(speed)}/s" if speed > 0 else ""
+            eta_text = f"~{int(eta)}s left" if eta > 0 and pct < 100 else ""
+            detail_parts = [p for p in [speed_text, eta_text] if p]
+            detail = "  —  ".join(detail_parts)
+
+            self._progress_label.setText(f"{size_text}\n{detail}" if detail else size_text)
+        else:
+            self._progress_label.setText(f"{self._fmt(received)} downloaded")
+
+    def finish(self):
+        """Hide the overlay."""
+        self.setVisible(False)
+
+    @staticmethod
+    def _fmt(size_bytes):
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.0f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
 class ClickableSlider(QSlider):
     """Custom slider that responds to clicks anywhere on the track"""
     __slots__ = ()  # Memory optimization
@@ -1839,6 +1966,12 @@ class SessionPanel(QFrame):
         if total > 0:
             pct = int(sent / total * 100)
             self.progress_label.setText(f"⬆ Uploading: {pct}% ({sent // 1024}KB / {total // 1024}KB)")
+        # Forward to video overlay
+        if self._player and hasattr(self._player, '_transfer_overlay'):
+            overlay = self._player._transfer_overlay
+            if not overlay.isVisible():
+                overlay.start("upload")
+            overlay.update_progress(sent, total)
 
     def _on_download_progress(self, recv, total):
         if total > 0:
@@ -1846,14 +1979,26 @@ class SessionPanel(QFrame):
             self.progress_label.setText(f"⬇ Downloading: {pct}%")
         else:
             self.progress_label.setText(f"⬇ Downloading: {recv // 1024}KB")
+        # Forward to video overlay
+        if self._player and hasattr(self._player, '_transfer_overlay'):
+            overlay = self._player._transfer_overlay
+            if not overlay.isVisible():
+                overlay.start("download")
+            overlay.update_progress(recv, total)
 
     def _on_video_uploaded(self, video_id, filename, size, uploader):
         self.progress_label.setText(f"📤 {uploader} shared: {filename}")
         QTimer.singleShot(5000, lambda: self.progress_label.setText(""))
+        # Hide overlay
+        if self._player and hasattr(self._player, '_transfer_overlay'):
+            self._player._transfer_overlay.finish()
 
     def _on_video_ready(self, video_id, local_path):
         self.progress_label.setText("✅ Video ready")
         self.now_playing_label.setText(f"▶ {os.path.basename(local_path)}")
+        # Hide overlay
+        if self._player and hasattr(self._player, '_transfer_overlay'):
+            self._player._transfer_overlay.finish()
 
         # If this was a join-in-progress sync, play immediately with sync state
         pending_id = getattr(self, '_pending_sync_video_id', None)
@@ -2283,6 +2428,9 @@ class VideoPlayer(QMainWindow):
         self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_frame.installEventFilter(self)  # Catch double-click for fullscreen
         video_layout.addWidget(self.video_frame)
+
+        # Transfer overlay (sits on top of video container)
+        self._transfer_overlay = TransferOverlay(video_container)
         
         main_layout.addWidget(video_container, stretch=1)
         
