@@ -8,6 +8,7 @@ import os
 import json
 import random
 import ctypes
+import shutil
 import argparse
 import logging
 import traceback
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QSlider, QLabel, QFrame, QSizePolicy,
     QFileDialog, QMessageBox, QDialog, QListWidget, QListWidgetItem,
-    QScrollArea, QCheckBox
+    QScrollArea, QCheckBox, QComboBox
 )
 from PySide6.QtCore import Qt, QTimer, QMimeData, QPoint, QPropertyAnimation, QEasingCurve, Signal, QObject, QEvent
 from PySide6.QtGui import QFont, QKeySequence, QIcon, QDrag, QPixmap, QPainter, QShortcut, QAction
@@ -107,6 +108,7 @@ class ConfigManager:
             "auto_hide_controls": False,
             "startup_mode": "ask",
             "show_advanced_info": False,
+            "dislike_action": "blacklist",
             "session": {
                 "server_ip": "",
                 "server_port": "8765",
@@ -456,6 +458,49 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(info_group)
         
+        # Dislike action dropdown
+        dislike_group = QFrame()
+        dislike_group.setStyleSheet(f"background-color: {COLORS['bg_medium']}; border-radius: 6px; padding: 8px;")
+        dislike_group_layout = QVBoxLayout(dislike_group)
+
+        dislike_label = QLabel("Dislike-Aktion")
+        dislike_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
+        dislike_group_layout.addWidget(dislike_label)
+
+        self.dislike_combo = QComboBox()
+        self.dislike_combo.addItem("Blacklist (aus Rotation entfernen)", "blacklist")
+        self.dislike_combo.addItem("In Papierkorb verschieben", "trash")
+        current_action = self.config_manager.get("dislike_action") or "blacklist"
+        idx = self.dislike_combo.findData(current_action)
+        if idx >= 0:
+            self.dislike_combo.setCurrentIndex(idx)
+        self.dislike_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 6px 8px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_primary']};
+                selection-background-color: {COLORS['accent_blue']};
+                border: 1px solid {COLORS['border']};
+            }}
+        """)
+        dislike_group_layout.addWidget(self.dislike_combo)
+
+        dislike_desc = QLabel("Papierkorb: Verschiebt die Datei in einen .trash-Ordner im Clips-Verzeichnis. Kann mit 'Unblock' wiederhergestellt werden.")
+        dislike_desc.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px;")
+        dislike_desc.setWordWrap(True)
+        dislike_group_layout.addWidget(dislike_desc)
+
+        layout.addWidget(dislike_group)
+        
         # Keybinds section
         keybind_label = QLabel("Keyboard Shortcuts")
         keybind_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: bold;")
@@ -573,6 +618,9 @@ class SettingsDialog(QDialog):
         
         # Save advanced info setting
         self.config_manager.set("show_advanced_info", self.advanced_info_cb.isChecked())
+        
+        # Save dislike action
+        self.config_manager.set("dislike_action", self.dislike_combo.currentData())
         
         # Save keybinds
         keybinds = {action_id: btn.key_name for action_id, btn in self.keybind_buttons.items()}
@@ -2411,7 +2459,33 @@ class VideoPlayer(QMainWindow):
             if removed:
                 self.blocked_clips -= removed
                 self.config_manager.set("blocked_clips", list(self.blocked_clips))
-                self.video_label.setText(f"✅ Unblocked {len(removed)} clips")
+                # Restore any trashed clips
+                restore_map = self.config_manager.get("restore_map") or {}
+                restored_count = 0
+                for clip_path in removed:
+                    # Find matching entry in restore_map by original path
+                    trash_key = None
+                    for key, original in restore_map.items():
+                        if original == clip_path:
+                            trash_key = key
+                            break
+                    if trash_key:
+                        # Try to restore from .trash
+                        clips_dir = os.path.dirname(clip_path)
+                        trash_path = os.path.join(clips_dir, ".trash", trash_key)
+                        if os.path.exists(trash_path):
+                            try:
+                                shutil.move(trash_path, clip_path)
+                                restored_count += 1
+                            except Exception:
+                                pass
+                        del restore_map[trash_key]
+                if restore_map != (self.config_manager.get("restore_map") or {}):
+                    self.config_manager.set("restore_map", restore_map)
+                msg = f"✅ Unblocked {len(removed)} clips"
+                if restored_count:
+                    msg += f" ({restored_count} restored from trash)"
+                self.video_label.setText(msg)
                 QTimer.singleShot(2000, lambda: self._update_status_bar() if not self.current_video else None)
 
     def _setup_ui(self):
@@ -2792,9 +2866,11 @@ class VideoPlayer(QMainWindow):
         has_video = bool(self.current_video)
         in_session = self._get_session_client() is not None
 
-        # Disable like/dislike in session mode (remote clips can't be favorited)
-        self.block_btn.setEnabled(has_video and not in_session)
-        self.like_btn.setEnabled(has_video and not in_session)
+        # Disable like/dislike in session mode for remote clips only
+        self.block_btn.setEnabled(has_video and not self._playing_remote_clip)
+        dislike_action = self.config_manager.get("dislike_action") or "blacklist"
+        self.block_btn.setToolTip("Dislike & Trash (Del)" if dislike_action == "trash" else "Dislike & Block (Del)")
+        self.like_btn.setEnabled(has_video and not self._playing_remote_clip)
         
         # Update Like button visual state (green when liked)
         if has_video and self.current_video in self.liked_clips:
@@ -2965,26 +3041,39 @@ class VideoPlayer(QMainWindow):
         QTimer.singleShot(1500, self._update_status_bar)
 
     def block_current_clip(self):
-        """Add current clip to blocked list and skip to next"""
+        """Add current clip to blocked list (or trash) and skip to next"""
         if not self.current_video:
             return
+        if self._playing_remote_clip:
+            return
             
-        # Confirm blocking (Dislike)
+        dislike_action = self.config_manager.get("dislike_action") or "blacklist"
+        
+        if dislike_action == "trash":
+            msg = "Dislike this clip?\nIt will be moved to a .trash folder in your clips directory."
+        else:
+            msg = "Dislike this clip?\nIt won't be shown in random playback again."
+
         reply = QMessageBox.question(
             self, 
             "Dislike Clip", 
-            "Dislike this clip?\nIt won't be shown in random playback again.",
+            msg,
             QMessageBox.Yes | QMessageBox.No, 
             QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
-            self.blocked_clips.add(self.current_video)
-            self.config_manager.set("blocked_clips", list(self.blocked_clips))
+            clip_path = self.current_video
+
+            if dislike_action == "trash":
+                self._trash_clip(clip_path)
+            else:
+                self.blocked_clips.add(clip_path)
+                self.config_manager.set("blocked_clips", list(self.blocked_clips))
             
             # Remove from likes if present
-            if self.current_video in self.liked_clips:
-                self.liked_clips.remove(self.current_video)
+            if clip_path in self.liked_clips:
+                self.liked_clips.remove(clip_path)
                 self.config_manager.set("liked_clips", list(self.liked_clips))
             
             self.status_label.setText("👎 Clip disliked")
@@ -2992,6 +3081,39 @@ class VideoPlayer(QMainWindow):
             
             # Immediately play next random clip
             self.play_random_clip()
+
+    def _trash_clip(self, filepath):
+        """Move a clip to a .trash folder inside the clips directory."""
+        if not filepath or not os.path.exists(filepath):
+            return
+        clips_dir = os.path.dirname(filepath)
+        trash_dir = os.path.join(clips_dir, ".trash")
+        os.makedirs(trash_dir, exist_ok=True)
+        
+        filename = os.path.basename(filepath)
+        dest = os.path.join(trash_dir, filename)
+        # Avoid overwrite: append suffix if needed
+        if os.path.exists(dest):
+            base, ext = os.path.splitext(filename)
+            counter = 1
+            while os.path.exists(dest):
+                dest = os.path.join(trash_dir, f"{base}_{counter}{ext}")
+                counter += 1
+        
+        try:
+            shutil.move(filepath, dest)
+        except Exception as e:
+            self.status_label.setText(f"⚠ Trash failed: {e}")
+            return
+        
+        # Track for restore: store original path in config
+        restore_map = self.config_manager.get("restore_map") or {}
+        restore_map[os.path.basename(dest)] = filepath
+        self.config_manager.set("restore_map", restore_map)
+        
+        # Also add to blocked list so it doesn't show up if .trash is inside scan path
+        self.blocked_clips.add(filepath)
+        self.config_manager.set("blocked_clips", list(self.blocked_clips))
 
     def _reset_cycle(self):
         """Reshuffle the queue"""
