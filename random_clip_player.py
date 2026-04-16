@@ -2606,6 +2606,9 @@ class VideoPlayer(QMainWindow):
             if client and not client.is_host:
                 self.play_btn.setText("▶  Play")
                 self.status_label.setText("⏳ Waiting for host...")
+            elif client and self._playing_remote_clip:
+                # We were playing someone else's clip — host triggers next
+                QTimer.singleShot(50, self.play_random_clip)
             else:
                 QTimer.singleShot(50, self.play_random_clip)
         else:
@@ -2626,6 +2629,9 @@ class VideoPlayer(QMainWindow):
             logging.getLogger("rdm").debug(f"_play_video: {filepath}")
             
         self.player.play(filepath)
+        # Explicitly unpause — after EOF with keep_open=True, player.pause
+        # stays True and player.play() inherits that stale state.
+        self.player.pause = False
         
         # Cache FPS after a short delay
         QTimer.singleShot(200, self._cache_fps)
@@ -3062,8 +3068,12 @@ class VideoPlayer(QMainWindow):
         Used for ready-sync: load the video, pause, then wait for all_ready."""
         if os.path.exists(local_path):
             self._ignore_remote = True
+            self._playing_remote_clip = True
             self.current_video = local_path
             self._play_video(local_path)
+            # Immediately pause — we need to wait for all_ready before playback
+            self.player.pause = True
+            self.play_btn.setText("▶  Play")
             self._ignore_remote = False
 
     def closeEvent(self, event):
