@@ -12,6 +12,7 @@ import shutil
 import argparse
 import logging
 import traceback
+from enum import Enum
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -41,6 +42,18 @@ else:
     os.environ["PATH"] = os.path.join(base_dir, "lib") + os.pathsep + os.environ.get("PATH", "")
 
 import mpv
+
+# ============================================================================
+# Session Phase Enum
+# ============================================================================
+
+class SessionPhase(Enum):
+    """Workflow phase for the current clip-change in a Watch Together session."""
+    IDLE = "idle"                # Nothing happening / normal playback
+    UPLOADING = "uploading"      # Uploading a clip to the session
+    DOWNLOADING = "downloading"  # Downloading a clip (prepare_video)
+    READY_WAIT = "ready_wait"    # Video loaded, waiting for all_ready
+    SYNCING = "syncing"          # Join-in-progress: waiting for sync video
 
 # ============================================================================
 # MPV Player Signals (thread-safe communication from MPV to UI)
@@ -1307,8 +1320,6 @@ class SessionPanel(QFrame):
 
         # Pending sync state (set when joining mid-session)
         self._pending_sync_state: dict = {}
-        self._pending_sync_video_id: str | None = None
-        self._pending_prepare_video_id: str | None = None
 
         self.setFixedWidth(280)
         self.setStyleSheet(f"""
@@ -1921,7 +1932,8 @@ class SessionPanel(QFrame):
         self.add_activity(f"🔄 Syncing to: {filename}")
         self.now_playing_label.setText(f"▶ {filename}")
         self._pending_sync_state = playback_state  # Will be applied once video_ready fires
-        self._pending_sync_video_id = video_id
+        if self._player:
+            self._player._set_session_phase(SessionPhase.SYNCING, video_id)
 
     def _on_user_joined(self, username, users):
         self._update_users_list(users)
@@ -1994,21 +2006,20 @@ class SessionPanel(QFrame):
     def _on_error(self, msg):
         self.connection_status.setText(f"❌ {msg}")
         self.connection_status.setStyleSheet(f"color: {COLORS['accent_red']}; font-size: 10px; border: none;")
-        # Clear uploading flag on error so user can try again
+        # Clear phase on error so user can try again
         if self._player:
-            self._player._session_uploading = False
+            self._player._set_session_phase(SessionPhase.IDLE)
 
     def _on_transition_busy(self, msg):
         """Server rejected our play_video — another transition is in progress."""
         self.add_activity(f"⏳ {msg}")
         self.progress_label.setText(f"⏳ {msg}")
         QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
-        # Reset uploading state so user can retry
+        # Reset phase so user can retry
         if self._player:
-            self._player._session_uploading = False
+            self._player._set_session_phase(SessionPhase.IDLE)
             self._player.status_label.setText(f"⏳ {msg}")
             QTimer.singleShot(3000, self._player._update_status_bar)
-            self._player._session_uploading = False
 
     def _show_disconnected(self, reason=""):
         self.connect_section.setVisible(True)
@@ -2021,7 +2032,7 @@ class SessionPanel(QFrame):
         if self._player:
             self._player._update_session_dot(False)
             self._player._session_shared_pool = False
-            self._player._session_uploading = False
+            self._player._set_session_phase(SessionPhase.IDLE)
             self._player._heartbeat_timer.stop()
 
     def _on_upload_progress(self, sent, total):
@@ -2062,9 +2073,11 @@ class SessionPanel(QFrame):
         if self._player and hasattr(self._player, '_transfer_overlay'):
             self._player._transfer_overlay.finish()
 
+        phase = self._player._session_phase if self._player else SessionPhase.IDLE
+        phase_vid = self._player._phase_video_id if self._player else None
+
         # If this was a join-in-progress sync, play immediately with sync state
-        pending_id = getattr(self, '_pending_sync_video_id', None)
-        if pending_id == video_id:
+        if phase == SessionPhase.SYNCING and phase_vid == video_id:
             if self._player:
                 self._player._play_session_video(video_id, local_path)
                 sync_state = getattr(self, '_pending_sync_state', {})
@@ -2086,18 +2099,18 @@ class SessionPanel(QFrame):
                     self._player._ignore_remote = False
                     self.add_activity("🔄 Synced to position")
                 QTimer.singleShot(500, _apply_sync)
-            self._pending_sync_video_id = None
+            if self._player:
+                self._player._set_session_phase(SessionPhase.IDLE)
             self._pending_sync_state = {}
             QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
             return
 
         # Ready-sync (non-host): load video, pause, report ready, wait for all_ready
-        pending_prepare = getattr(self, '_pending_prepare_video_id', None)
-        if pending_prepare == video_id:
+        if phase == SessionPhase.DOWNLOADING and phase_vid == video_id:
             if self._player:
                 self._player._load_session_video(local_path)
+                self._player._set_session_phase(SessionPhase.READY_WAIT, video_id)
                 QTimer.singleShot(200, lambda: self._pause_and_report_ready(video_id))
-            self._pending_prepare_video_id = None
             QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
             return
 
@@ -2136,7 +2149,8 @@ class SessionPanel(QFrame):
 
     def _on_prepare_video(self, video_id, filename, username):
         """Server says a new video is coming — download it and wait."""
-        self._pending_prepare_video_id = video_id
+        if self._player:
+            self._player._set_session_phase(SessionPhase.DOWNLOADING, video_id)
         self.add_activity(f"🎬 {username} shared {filename}")
         self.now_playing_label.setText(f"▶ {filename}")
         self.progress_label.setText(f"⬇ Downloading from {username}...")
@@ -2147,7 +2161,7 @@ class SessionPanel(QFrame):
         self.progress_label.setText("▶ Playing!")
         QTimer.singleShot(2000, lambda: self.progress_label.setText(""))
         if self._player and self._player.player:
-            self._player._session_uploading = False
+            self._player._set_session_phase(SessionPhase.IDLE)
             self._player._operation_status = ""  # Clear persistent status
             # Check if WE uploaded this clip — don't mark as remote if so
             own_id = self.session_client.user_id if self.session_client else None
@@ -2266,7 +2280,12 @@ class VideoPlayer(QMainWindow):
         self._session_panel = None
         self._session_shared_pool = False  # Shared random pool mode
         self._playing_remote_clip = False  # True when current clip came from another user
-        self._session_uploading = False    # True while uploading a clip to session
+        self._session_phase = SessionPhase.IDLE
+        self._phase_video_id: str | None = None
+        self._phase_timeout_timer = QTimer()
+        self._phase_timeout_timer.setInterval(60000)
+        self._phase_timeout_timer.setSingleShot(True)
+        self._phase_timeout_timer.timeout.connect(self._on_phase_timeout)
         self._last_ping_ms = 0             # Latest RTT for heartbeat compensation
         self._heartbeat_timer = QTimer()
         self._heartbeat_timer.setInterval(5000)
@@ -2929,9 +2948,9 @@ class VideoPlayer(QMainWindow):
 
     def play_random_clip(self):
         """Play next random clip from shuffled queue"""
-        # Block if we're already uploading a clip to the session
-        if self._session_uploading:
-            self._operation_status = "⏳ Upload in progress..."
+        # Block if session is busy with another clip-change
+        if self._session_phase != SessionPhase.IDLE:
+            self._operation_status = f"⏳ {self._session_phase.value} in progress..."
             self.status_label.setText(self._operation_status)
             return
 
@@ -2980,8 +2999,8 @@ class VideoPlayer(QMainWindow):
 
     def play_previous_clip(self):
         """Navigate to the previous clip in queue"""
-        if self._session_uploading:
-            self._operation_status = "⏳ Upload in progress..."
+        if self._session_phase != SessionPhase.IDLE:
+            self._operation_status = f"⏳ {self._session_phase.value} in progress..."
             self.status_label.setText(self._operation_status)
             return
         self._playing_remote_clip = False
@@ -3587,6 +3606,44 @@ class VideoPlayer(QMainWindow):
     # ========================================================================
     # Session (Watch Together) Integration
     # ========================================================================
+
+    def _set_session_phase(self, phase, video_id=None):
+        """Transition to a new session workflow phase with validation."""
+        old = self._session_phase
+        if phase != SessionPhase.IDLE and old != SessionPhase.IDLE:
+            if DEBUG_MODE:
+                logging.getLogger("rdm").debug(
+                    f"Session phase override: {old.value} → {phase.value} (expected IDLE)")
+        self._session_phase = phase
+        if phase == SessionPhase.IDLE:
+            self._phase_video_id = None
+            self._phase_timeout_timer.stop()
+        else:
+            if video_id is not None:
+                self._phase_video_id = video_id
+            self._phase_timeout_timer.start()
+        if DEBUG_MODE:
+            logging.getLogger("rdm").debug(f"Session phase: {old.value} → {phase.value}")
+
+    def _on_phase_timeout(self):
+        """Force-reset to IDLE if stuck in a non-IDLE phase for >60s."""
+        if self._session_phase != SessionPhase.IDLE:
+            logging.getLogger("rdm").warning(
+                f"Session phase timeout — stuck in {self._session_phase.value}, forcing IDLE")
+            self._set_session_phase(SessionPhase.IDLE)
+            self.status_label.setText("⚠ Session phase timeout — reset")
+            QTimer.singleShot(3000, self._update_status_bar)
+
+    @property
+    def _session_uploading(self):
+        return self._session_phase == SessionPhase.UPLOADING
+
+    @_session_uploading.setter
+    def _session_uploading(self, value):
+        if value:
+            self._set_session_phase(SessionPhase.UPLOADING)
+        else:
+            self._set_session_phase(SessionPhase.IDLE)
 
     def _toggle_session_panel(self):
         """Show/hide the session panel."""
