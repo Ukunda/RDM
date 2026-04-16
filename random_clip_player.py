@@ -106,6 +106,7 @@ class ConfigManager:
             "favorites_only": False,
             "auto_hide_controls": False,
             "startup_mode": "ask",
+            "show_advanced_info": False,
             "session": {
                 "server_ip": "",
                 "server_port": "8765",
@@ -424,6 +425,37 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(startup_group)
         
+        # Advanced info toggle
+        info_group = QFrame()
+        info_group.setStyleSheet(f"background-color: {COLORS['bg_medium']}; border-radius: 6px; padding: 8px;")
+        info_group_layout = QVBoxLayout(info_group)
+
+        self.advanced_info_cb = QPushButton("Erweiterte Infos anzeigen")
+        self.advanced_info_cb.setCheckable(True)
+        self.advanced_info_cb.setChecked(self.config_manager.get("show_advanced_info") or False)
+        self.advanced_info_cb.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 8px;
+                text-align: left;
+            }}
+            QPushButton:checked {{
+                background-color: {COLORS['accent_blue']};
+                border-color: {COLORS['accent_blue']};
+            }}
+        """)
+        info_group_layout.addWidget(self.advanced_info_cb)
+
+        adv_info_desc = QLabel("Zeigt Dateigröße, Auflösung und Codec im Status und Activity-Feed")
+        adv_info_desc.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
+        adv_info_desc.setWordWrap(True)
+        info_group_layout.addWidget(adv_info_desc)
+
+        layout.addWidget(info_group)
+        
         # Keybinds section
         keybind_label = QLabel("Keyboard Shortcuts")
         keybind_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: bold;")
@@ -538,6 +570,9 @@ class SettingsDialog(QDialog):
         """Save settings and close dialog"""
         # Save auto-hide setting
         self.config_manager.set("auto_hide_controls", self.auto_hide_cb.isChecked())
+        
+        # Save advanced info setting
+        self.config_manager.set("show_advanced_info", self.advanced_info_cb.isChecked())
         
         # Save keybinds
         keybinds = {action_id: btn.key_name for action_id, btn in self.keybind_buttons.items()}
@@ -1906,6 +1941,7 @@ class SessionPanel(QFrame):
         QTimer.singleShot(2000, lambda: self.progress_label.setText(""))
         if self._player and self._player.player:
             self._player._session_uploading = False
+            self._player._operation_status = ""  # Clear persistent status
             self._player._playing_remote_clip = True  # Don't re-share when this clip ends
             self._player._ignore_remote = True
             self._player.player.seek(0, reference='absolute')
@@ -1985,6 +2021,7 @@ class VideoPlayer(QMainWindow):
         self.autoplay_enabled = self.config_manager.get("autoplay")
         self.favorites_only = self.config_manager.get("favorites_only") or False
         self.auto_hide_controls = self.config_manager.get("auto_hide_controls") or False
+        self.show_advanced_info = self.config_manager.get("show_advanced_info") or False
         self.play_queue = []  # Shuffled list of clips
         self.queue_index = -1  # Current position in shuffled list
         
@@ -1992,6 +2029,7 @@ class VideoPlayer(QMainWindow):
         self.is_slider_pressed = False
         self._last_volume = self.config_manager.get("volume")
         self._cached_fps = 0  # Cache FPS to avoid repeated property queries
+        self._operation_status = ""  # Persistent status during operations (upload, sync, etc.)
         
         # Session (Watch Together) state
         self._session_active = False
@@ -2148,6 +2186,7 @@ class VideoPlayer(QMainWindow):
             # Update auto-hide state
             old_auto_hide = self.auto_hide_controls
             self.auto_hide_controls = self.config_manager.get("auto_hide_controls") or False
+            self.show_advanced_info = self.config_manager.get("show_advanced_info") or False
             
             if self.auto_hide_controls:
                 self.status_label.setText("Auto-hide enabled")
@@ -2628,7 +2667,8 @@ class VideoPlayer(QMainWindow):
         """Play next random clip from shuffled queue"""
         # Block if we're already uploading a clip to the session
         if self._session_uploading:
-            self.status_label.setText("⏳ Upload in progress...")
+            self._operation_status = "⏳ Upload in progress..."
+            self.status_label.setText(self._operation_status)
             return
 
         self._playing_remote_clip = False
@@ -2665,17 +2705,20 @@ class VideoPlayer(QMainWindow):
             filename = os.path.basename(self.current_video)
             self.video_label.setText(f"⏳ Uploading: {filename}")
             self.video_label.setStyleSheet(f"color: {COLORS['accent_orange']}; font-size: 13px; padding: 6px 4px;")
-            self.status_label.setText("⏳ Syncing with session...")
+            self._operation_status = "⏳ Syncing with session..."
+            self.status_label.setText(self._operation_status)
             self._session_auto_share()
             return
 
         # Not in session — play locally immediately
+        self._operation_status = ""  # Clear operation status for local playback
         self._play_video(self.current_video)
 
     def play_previous_clip(self):
         """Navigate to the previous clip in queue"""
         if self._session_uploading:
-            self.status_label.setText("⏳ Upload in progress...")
+            self._operation_status = "⏳ Upload in progress..."
+            self.status_label.setText(self._operation_status)
             return
         self._playing_remote_clip = False
         if self.queue_index > 0:
@@ -2688,11 +2731,13 @@ class VideoPlayer(QMainWindow):
             if client:
                 filename = os.path.basename(self.current_video)
                 self.video_label.setText(f"⏳ Uploading: {filename}")
-                self.status_label.setText("⏳ Syncing with session...")
+                self._operation_status = "⏳ Syncing with session..."
+                self.status_label.setText(self._operation_status)
                 self._session_auto_share()
                 return
 
             # Not in session — play locally
+            self._operation_status = ""
             self._play_video(self.current_video)
 
     def toggle_autoplay(self):
@@ -2877,6 +2922,10 @@ class VideoPlayer(QMainWindow):
         self.video_label.setText(f"▶  {display_name}")
         self.video_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px; padding: 6px 4px;")
         
+        # Show advanced info (file size, resolution, codec) after MPV has loaded
+        if self.show_advanced_info:
+            QTimer.singleShot(500, lambda p=filepath: self._show_advanced_video_info(p))
+        
         # Apply current playback rate from speed button
         self._apply_current_speed()
 
@@ -2930,6 +2979,7 @@ class VideoPlayer(QMainWindow):
         if not self.player:
             return
         self.player.stop()
+        self._operation_status = ""  # Clear any persistent operation status
         self.play_btn.setText("▶  Play")
         self.time_slider.setValue(0)
         self.time_label.setText("0:00")
@@ -3050,6 +3100,10 @@ class VideoPlayer(QMainWindow):
 
     def _update_status_bar(self):
         """Update the status bar with current state info"""
+        # Don't overwrite persistent operation status
+        if self._operation_status:
+            self.status_label.setText(self._operation_status)
+            return
         if not self.play_queue:
             self.status_label.setText("Ready")
             return
@@ -3061,7 +3115,46 @@ class VideoPlayer(QMainWindow):
         if self.autoplay_enabled:
             parts.append("Autoplay ON")
         
+        if self.show_advanced_info and self.current_video and os.path.exists(self.current_video):
+            size = self._format_file_size(os.path.getsize(self.current_video))
+            parts.append(size)
+        
         self.status_label.setText("  •  ".join(parts))
+
+    def _show_advanced_video_info(self, filepath):
+        """Show advanced video metadata in the status label."""
+        if not self.player or not os.path.exists(filepath):
+            return
+        try:
+            parts = []
+            # File size
+            size = self._format_file_size(os.path.getsize(filepath))
+            parts.append(size)
+            # Resolution from MPV
+            vp = self.player.video_params
+            if vp and 'w' in vp and 'h' in vp:
+                parts.append(f"{vp['w']}×{vp['h']}")
+            # Video codec
+            vcodec = self.player.video_codec
+            if vcodec:
+                # Simplify codec string (e.g. "h264 (High)" → "h264")
+                parts.append(vcodec.split()[0] if ' ' in vcodec else vcodec)
+            if parts:
+                self.status_label.setText("  •  ".join(parts))
+        except Exception:
+            pass  # MPV properties may not be available yet
+
+    @staticmethod
+    def _format_file_size(size_bytes):
+        """Format bytes to human-readable string."""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
     @staticmethod
     def _format_time(ms):
@@ -3201,8 +3294,13 @@ class VideoPlayer(QMainWindow):
             if DEBUG_MODE:
                 logging.getLogger("rdm").debug(f"Auto-sharing: {self.current_video}")
             if self._session_panel:
+                filename = os.path.basename(self.current_video)
                 self._session_panel.progress_label.setText("⏳ Sharing clip...")
-                self._session_panel.add_activity(f"📤 You shared {os.path.basename(self.current_video)}")
+                activity = f"📤 You shared {filename}"
+                if self.show_advanced_info:
+                    size = self._format_file_size(os.path.getsize(self.current_video))
+                    activity += f" ({size})"
+                self._session_panel.add_activity(activity)
             client.upload_and_play(self.current_video)
 
     def _on_random_clip_requested(self):
