@@ -1842,6 +1842,7 @@ class VideoPlayer(QMainWindow):
         self._session_shared_pool = False  # Shared random pool mode
         self._playing_remote_clip = False  # True when current clip came from another user
         self._session_uploading = False    # True while uploading a clip to session
+        self._is_fullscreen = False            # Fullscreen state
         
         # Setup UI (must come before MPV init so video_frame exists)
         self._setup_ui()
@@ -2042,6 +2043,7 @@ class VideoPlayer(QMainWindow):
         self.video_frame = QFrame()
         self.video_frame.setStyleSheet("background-color: #000000; border-radius: 4px;")
         self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_frame.installEventFilter(self)  # Catch double-click for fullscreen
         video_layout.addWidget(self.video_frame)
         
         main_layout.addWidget(video_container, stretch=1)
@@ -2327,6 +2329,11 @@ class VideoPlayer(QMainWindow):
                 shortcut = QShortcut(QKeySequence(key_map[key_name]), self)
                 shortcut.activated.connect(callback)
                 self._shortcuts.append(shortcut)
+
+        # F11 — fullscreen toggle (hardcoded, not configurable)
+        fs_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
+        fs_shortcut.activated.connect(self._toggle_fullscreen)
+        self._shortcuts.append(fs_shortcut)
 
     # ========================================================================
     # Folder and Clip Management
@@ -2717,7 +2724,10 @@ class VideoPlayer(QMainWindow):
         self.player.speed = speed
 
     def _stop(self):
-        """Stop playback completely"""
+        """Stop playback completely. In fullscreen, exit fullscreen instead."""
+        if self._is_fullscreen:
+            self._toggle_fullscreen()
+            return
         if not self.player:
             return
         self.player.stop()
@@ -2872,6 +2882,46 @@ class VideoPlayer(QMainWindow):
     # ========================================================================
     # Event Handlers
     # ========================================================================
+
+    def eventFilter(self, obj, event):
+        """Catch double-click on video frame for fullscreen toggle."""
+        if obj is self.video_frame and event.type() == QEvent.Type.MouseButtonDblClick:
+            self._toggle_fullscreen()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _toggle_fullscreen(self):
+        """Toggle between fullscreen and normal window mode."""
+        if self._is_fullscreen:
+            # Restore normal window
+            self.showNormal()
+            navbar = self.menuBar()
+            if navbar:
+                navbar.setVisible(True)
+            self.controls_container.setVisible(True)
+            self.controls_container.setMaximumHeight(16777215)
+            if self._session_panel and self._session_active:
+                self._session_panel.setVisible(True)
+            self._is_fullscreen = False
+        else:
+            # Save state and go fullscreen
+            self.showFullScreen()
+            navbar = self.menuBar()
+            if navbar:
+                navbar.setVisible(False)
+            # Keep controls visible (auto-hide will handle them if enabled)
+            if not self.auto_hide_controls:
+                self.controls_container.setVisible(True)
+            if self._session_panel:
+                self._session_panel.setVisible(False)
+            self._is_fullscreen = True
+
+    def keyPressEvent(self, event):
+        """Handle Escape to exit fullscreen."""
+        if event.key() == Qt.Key.Key_Escape and self._is_fullscreen:
+            self._toggle_fullscreen()
+            return
+        super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event):
         """Handle mouse movement for auto-hide controls"""
