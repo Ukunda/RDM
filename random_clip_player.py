@@ -9,6 +9,9 @@ import json
 import random
 import ctypes
 import shutil
+import subprocess
+import tempfile
+import threading
 import argparse
 import logging
 import traceback
@@ -18,7 +21,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QSlider, QLabel, QFrame, QSizePolicy,
     QFileDialog, QMessageBox, QDialog, QListWidget, QListWidgetItem,
-    QScrollArea, QCheckBox, QComboBox
+    QScrollArea, QCheckBox, QComboBox, QProgressDialog, QTextBrowser,
+    QDialogButtonBox
 )
 from PySide6.QtCore import Qt, QTimer, QMimeData, QPoint, QPropertyAnimation, QEasingCurve, Signal, QObject, QEvent
 from PySide6.QtGui import QFont, QKeySequence, QIcon, QDrag, QPixmap, QPainter, QShortcut, QAction
@@ -73,6 +77,9 @@ class PlayerSignals(QObject):
 # Constants
 # ============================================================================
 
+VERSION = "4.5.0"
+GITHUB_REPO = "Ukunda/RDM"
+
 VIDEO_EXTENSIONS = {
     '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', 
     '.webm', '.m4v', '.mpeg', '.mpg', '.3gp', '.ts', '.mts'
@@ -122,6 +129,7 @@ class ConfigManager:
             "startup_mode": "ask",
             "show_advanced_info": False,
             "dislike_action": "blacklist",
+            "skipped_version": "",
             "session": {
                 "server_ip": "",
                 "server_port": "8765",
@@ -2234,6 +2242,258 @@ class SessionPanel(QFrame):
 
 
 # ============================================================================
+# Auto-Updater
+# ============================================================================
+
+def _parse_version(tag: str) -> tuple:
+    """Parse a version tag like 'v1.2.3' or '1.2' into a comparable tuple."""
+    tag = tag.strip().lstrip("vV")
+    parts = []
+    for p in tag.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    # Pad to at least 3 components for consistent comparison
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+class UpdateSignals(QObject):
+    """Thread-safe signals for update checker → UI."""
+    update_available = Signal(str, str, str)  # (tag_name, body/notes, download_url)
+    no_update = Signal()
+    check_failed = Signal()
+
+
+class UpdateChecker:
+    """Checks GitHub releases for a newer version in a background thread."""
+
+    def __init__(self, config_manager: ConfigManager):
+        self.signals = UpdateSignals()
+        self._config = config_manager
+
+    def check(self):
+        """Start the update check in a background thread (non-blocking)."""
+        threading.Thread(target=self._check_thread, daemon=True).start()
+
+    def _check_thread(self):
+        import urllib.request
+        import urllib.error
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(url, headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "RandomClipPlayer-UpdateCheck",
+            })
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+
+            tag = data.get("tag_name", "")
+            body = data.get("body", "")
+            assets = data.get("assets", [])
+            download_url = ""
+            for asset in assets:
+                name = asset.get("name", "").lower()
+                if name.endswith(".exe"):
+                    download_url = asset.get("browser_download_url", "")
+                    break
+            if not download_url:
+                # Fallback to html_url so user can download manually
+                download_url = data.get("html_url", "")
+
+            remote_ver = _parse_version(tag)
+            local_ver = _parse_version(VERSION)
+
+            if remote_ver <= local_ver:
+                self.signals.no_update.emit()
+                return
+
+            # Check if user explicitly skipped this version
+            skipped = self._config.get("skipped_version") or ""
+            if skipped and _parse_version(skipped) >= remote_ver:
+                self.signals.no_update.emit()
+                return
+
+            self.signals.update_available.emit(tag, body, download_url)
+
+        except Exception:
+            self.signals.check_failed.emit()
+
+
+class UpdateDialog(QDialog):
+    """Dialog shown when a new version is available."""
+
+    def __init__(self, tag: str, notes: str, download_url: str, config_manager: ConfigManager, parent=None):
+        super().__init__(parent)
+        self._tag = tag
+        self._notes = notes
+        self._download_url = download_url
+        self._config = config_manager
+        self._is_exe = "__compiled__" in globals() or getattr(sys, "frozen", False)
+
+        self.setWindowTitle("Update verfügbar")
+        self.setMinimumSize(480, 360)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        header = QLabel(f"<b>Update verfügbar: {VERSION} → {self._tag}</b>")
+        header.setStyleSheet(f"font-size: 14px; color: {COLORS['text_primary']};")
+        layout.addWidget(header)
+
+        notes_view = QTextBrowser()
+        notes_view.setMarkdown(self._notes or "*Keine Release-Notes.*")
+        notes_view.setOpenExternalLinks(True)
+        notes_view.setStyleSheet(
+            f"background: {COLORS['bg_dark']}; color: {COLORS['text_primary']}; "
+            f"border: 1px solid {COLORS['border']}; padding: 8px;"
+        )
+        layout.addWidget(notes_view, stretch=1)
+
+        btn_layout = QHBoxLayout()
+
+        if self._is_exe and self._download_url.endswith(".exe"):
+            btn_update = QPushButton("Jetzt updaten")
+            btn_update.setStyleSheet(
+                f"background: {COLORS['accent_green']}; color: white; "
+                "padding: 6px 16px; border-radius: 4px; font-weight: bold;"
+            )
+            btn_update.clicked.connect(self._do_update)
+            btn_layout.addWidget(btn_update)
+        else:
+            btn_open = QPushButton("Auf GitHub öffnen")
+            btn_open.setStyleSheet(
+                f"background: {COLORS['accent_blue']}; color: white; "
+                "padding: 6px 16px; border-radius: 4px; font-weight: bold;"
+            )
+            btn_open.clicked.connect(self._open_release_page)
+            btn_layout.addWidget(btn_open)
+
+        btn_later = QPushButton("Später")
+        btn_later.setStyleSheet(
+            f"background: {COLORS['bg_light']}; color: {COLORS['text_primary']}; "
+            "padding: 6px 16px; border-radius: 4px;"
+        )
+        btn_later.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_later)
+
+        btn_skip = QPushButton("Überspringen")
+        btn_skip.setStyleSheet(
+            f"background: {COLORS['bg_light']}; color: {COLORS['text_secondary']}; "
+            "padding: 6px 12px; border-radius: 4px;"
+        )
+        btn_skip.clicked.connect(self._skip_version)
+        btn_layout.addWidget(btn_skip)
+
+        layout.addLayout(btn_layout)
+
+        self.setStyleSheet(
+            f"QDialog {{ background: {COLORS['bg_medium']}; }}"
+        )
+
+    def _skip_version(self):
+        self._config.set("skipped_version", self._tag)
+        self.reject()
+
+    def _open_release_page(self):
+        import webbrowser
+        url = self._download_url
+        if not url.startswith("http"):
+            url = f"https://github.com/{GITHUB_REPO}/releases/latest"
+        webbrowser.open(url)
+        self.accept()
+
+    def _do_update(self):
+        """Download the .exe, swap it in, and relaunch."""
+        self.setEnabled(False)
+
+        progress = QProgressDialog("Update wird heruntergeladen…", "Abbrechen", 0, 100, self)
+        progress.setWindowTitle("Update")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.setStyleSheet(
+            f"QProgressDialog {{ background: {COLORS['bg_medium']}; color: {COLORS['text_primary']}; }}"
+        )
+
+        import urllib.request
+        import urllib.error
+
+        tmp_path = os.path.join(tempfile.gettempdir(), "rdm_update.exe")
+
+        try:
+            req = urllib.request.Request(self._download_url, headers={
+                "User-Agent": "RandomClipPlayer-Update",
+            })
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                received = 0
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        if progress.wasCanceled():
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                            self.setEnabled(True)
+                            return
+                        chunk = resp.read(262144)  # 256KB
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        received += len(chunk)
+                        if total > 0:
+                            progress.setValue(int(received * 100 / total))
+                        QApplication.processEvents()
+
+            progress.setValue(100)
+
+            current_exe = sys.executable
+            old_exe = current_exe + ".old"
+
+            # Remove any previous .old file
+            try:
+                if os.path.exists(old_exe):
+                    os.remove(old_exe)
+            except OSError:
+                pass
+
+            try:
+                os.rename(current_exe, old_exe)
+                shutil.move(tmp_path, current_exe)
+            except OSError as e:
+                # Rollback
+                try:
+                    if os.path.exists(old_exe) and not os.path.exists(current_exe):
+                        os.rename(old_exe, current_exe)
+                except OSError:
+                    pass
+                QMessageBox.critical(self, "Update fehlgeschlagen", str(e))
+                self.setEnabled(True)
+                return
+
+            # Launch the updated exe and exit
+            DETACHED_PROCESS = 0x00000008
+            subprocess.Popen(
+                [current_exe],
+                creationflags=DETACHED_PROCESS,
+                close_fds=True,
+            )
+            QApplication.quit()
+
+        except Exception as e:
+            progress.close()
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            QMessageBox.critical(self, "Update fehlgeschlagen", str(e))
+            self.setEnabled(True)
+
+
+# ============================================================================
 # Main Application
 # ============================================================================
 
@@ -2242,7 +2502,7 @@ class VideoPlayer(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Random Clip Player v4.5")
+        self.setWindowTitle(f"Random Clip Player v{VERSION}")
         self.setGeometry(100, 100, 1100, 700)
         self.setMinimumSize(800, 550)
         
@@ -3954,6 +4214,15 @@ def main():
     if args.debug:
         _setup_debug()
 
+    # Clean up leftover .old file from a previous update
+    if "__compiled__" in globals() or getattr(sys, "frozen", False):
+        old_exe = sys.executable + ".old"
+        try:
+            if os.path.exists(old_exe):
+                os.remove(old_exe)
+        except OSError:
+            pass
+
     # Note: High DPI scaling is always enabled in Qt6/PySide6
     app = QApplication(sys.argv)
     app.setApplicationName("Random Clip Player")
@@ -3967,7 +4236,7 @@ def main():
 
     # Debug overlay: show a small label in the title bar
     if DEBUG_MODE:
-        player.setWindowTitle("Random Clip Player v4.5 [DEBUG]")
+        player.setWindowTitle(f"Random Clip Player v{VERSION} [DEBUG]")
         if player.player is not None:
             try:
                 logging.getLogger("rdm").info(f"MPV version: {player.player.mpv_version}")
@@ -3977,7 +4246,18 @@ def main():
         logging.getLogger("rdm").info(f"Session module: {'available' if SESSION_AVAILABLE else 'NOT available'}")
 
     player.show()
-    
+
+    # Auto-update check (non-blocking, background thread)
+    def _on_update_available(tag, notes, download_url):
+        dlg = UpdateDialog(tag, notes, download_url, player.config_manager, parent=player)
+        dlg.exec()
+
+    updater = UpdateChecker(player.config_manager)
+    updater.signals.update_available.connect(_on_update_available)
+    # Keep reference alive
+    player._update_checker = updater
+    updater.check()
+
     sys.exit(app.exec())
 
 
