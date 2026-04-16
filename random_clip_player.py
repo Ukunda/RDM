@@ -1849,7 +1849,13 @@ class VideoPlayer(QMainWindow):
         self._apply_global_styles()
 
         # MPV instance and player — create AFTER UI is fully styled
-        self.player = mpv.MPV(wid=int(self.video_frame.winId()), vo='gpu', hwdec='auto', keep_open=True)
+        self.player = mpv.MPV(
+            wid=int(self.video_frame.winId()),
+            vo='gpu',
+            hwdec='auto',
+            keep_open=True,
+            af='scaletempo2',  # Pitch-correct audio at variable playback speeds
+        )
         self._setup_mpv_callbacks()
         
         # Set initial volume
