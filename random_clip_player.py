@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QSlider, QLabel, QFrame, QSizePolicy,
     QFileDialog, QMessageBox, QDialog, QListWidget, QListWidgetItem,
-    QScrollArea
+    QScrollArea, QCheckBox
 )
 from PySide6.QtCore import Qt, QTimer, QMimeData, QPoint, QPropertyAnimation, QEasingCurve, Signal, QObject, QEvent
 from PySide6.QtGui import QFont, QKeySequence, QIcon, QDrag, QPixmap, QPainter, QShortcut, QAction
@@ -105,6 +105,7 @@ class ConfigManager:
             "autoplay": False,
             "favorites_only": False,
             "auto_hide_controls": False,
+            "startup_mode": "ask",
             "session": {
                 "server_ip": "",
                 "server_port": "8765",
@@ -392,6 +393,37 @@ class SettingsDialog(QDialog):
         
         layout.addWidget(controls_group)
         
+        # Startup mode reset
+        startup_group = QFrame()
+        startup_group.setStyleSheet(f"background-color: {COLORS['bg_medium']}; border-radius: 6px; padding: 8px;")
+        startup_layout = QVBoxLayout(startup_group)
+
+        current_mode = self.config_manager.get("startup_mode") or "ask"
+        mode_labels = {"ask": "Jedes Mal fragen", "viewer": "Nur zuschauen", "clips": "Eigene Clips"}
+        startup_info = QLabel(f"Startup-Modus: {mode_labels.get(current_mode, current_mode)}")
+        startup_info.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
+        startup_layout.addWidget(startup_info)
+
+        reset_startup_btn = QPushButton("Startup-Dialog zurücksetzen")
+        reset_startup_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 8px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['bg_medium']};
+                border-color: {COLORS['text_muted']};
+            }}
+        """)
+        reset_startup_btn.clicked.connect(lambda: self._reset_startup_mode(startup_info))
+        startup_layout.addWidget(reset_startup_btn)
+
+        layout.addWidget(startup_group)
+        
         # Keybinds section
         keybind_label = QLabel("Keyboard Shortcuts")
         keybind_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: bold;")
@@ -496,7 +528,12 @@ class SettingsDialog(QDialog):
             if action_id in self.keybind_buttons:
                 self.keybind_buttons[action_id].key_name = key
                 self.keybind_buttons[action_id].setText(key)
-                
+
+    def _reset_startup_mode(self, info_label):
+        """Reset startup mode to 'ask' so the dialog appears again next launch."""
+        self.config_manager.set("startup_mode", "ask")
+        info_label.setText("Startup-Modus: Jedes Mal fragen")
+
     def _save_and_close(self):
         """Save settings and close dialog"""
         # Save auto-hide setting
@@ -527,6 +564,128 @@ class SettingsDialog(QDialog):
             }}
             QLabel {{
                 color: {COLORS['text_primary']};
+            }}
+        """)
+
+
+# ============================================================================
+# Startup Dialog
+# ============================================================================
+
+class StartupDialog(QDialog):
+    """Startup dialog asking user to choose between viewer-only and clip-sharing mode."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Random Clip Player")
+        self.setFixedSize(480, 320)
+        self.chosen_mode = None  # "viewer" or "clips"
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(24, 24, 24, 24)
+
+        # Title
+        title = QLabel("Willkommen!")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 20px; font-weight: bold;")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Was möchtest du tun?")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px;")
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(8)
+
+        # Card buttons row
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(12)
+
+        # Card A: Viewer only
+        viewer_card = self._make_card(
+            "👀",
+            "Nur zuschauen",
+            "Direkt einer Session beitreten\nohne eigene Clips",
+            COLORS['accent_blue'],
+        )
+        viewer_card.clicked.connect(self._choose_viewer)
+        cards_layout.addWidget(viewer_card)
+
+        # Card B: I have clips
+        clips_card = self._make_card(
+            "🎬",
+            "Eigene Clips",
+            "Clips-Ordner auswählen\nund teilen",
+            COLORS['accent_green'],
+        )
+        clips_card.clicked.connect(self._choose_clips)
+        cards_layout.addWidget(clips_card)
+
+        layout.addLayout(cards_layout)
+
+        layout.addSpacing(4)
+
+        # "Don't ask again" checkbox
+        self.remember_cb = QCheckBox("Auswahl merken (kann in Settings zurückgesetzt werden)")
+        self.remember_cb.setStyleSheet(f"""
+            QCheckBox {{
+                color: {COLORS['text_muted']};
+                font-size: 11px;
+                spacing: 6px;
+            }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid {COLORS['border']};
+                border-radius: 3px;
+                background-color: {COLORS['bg_dark']};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {COLORS['accent_blue']};
+                border-color: {COLORS['accent_blue']};
+            }}
+        """)
+        layout.addWidget(self.remember_cb, alignment=Qt.AlignCenter)
+
+        self._apply_styles()
+
+    def _make_card(self, icon: str, title: str, description: str, accent: str) -> QPushButton:
+        btn = QPushButton(f"{icon}\n{title}\n\n{description}")
+        btn.setFixedHeight(150)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 10px;
+                font-size: 13px;
+                padding: 16px;
+                text-align: center;
+            }}
+            QPushButton:hover {{
+                border-color: {accent};
+                background-color: {COLORS['bg_light']};
+            }}
+            QPushButton:pressed {{
+                background-color: {accent};
+            }}
+        """)
+        return btn
+
+    def _choose_viewer(self):
+        self.chosen_mode = "viewer"
+        self.accept()
+
+    def _choose_clips(self):
+        self.chosen_mode = "clips"
+        self.accept()
+
+    def _apply_styles(self):
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {COLORS['bg_dark']};
             }}
         """)
 
@@ -1075,7 +1234,6 @@ class SessionPanel(QFrame):
         sess_layout.addWidget(self.ping_label)
 
         # Shared random pool toggle (host only)
-        from PySide6.QtWidgets import QCheckBox
         self.shared_pool_cb = QCheckBox("🎲 Shared random pool")
         self.shared_pool_cb.setToolTip("When on, Random Clip picks from a random user's gallery")
         self.shared_pool_cb.setStyleSheet(f"""
@@ -1864,13 +2022,21 @@ class VideoPlayer(QMainWindow):
 
         self._setup_keyboard_shortcuts()
         
-        # Initial folder check
-        if not self.clips_folder or not os.path.exists(self.clips_folder):
-            self.video_label.setText("⚠  Please select a clips folder to begin")
-            QTimer.singleShot(500, self.select_folder) # Delay slightly to let UI render
+        # Startup mode routing
+        startup_mode = self.config_manager.get("startup_mode") or "ask"
+        self._viewer_only = False
+
+        if startup_mode == "viewer":
+            # Viewer-only: skip folder, open session panel
+            self._viewer_only = True
+            self.video_label.setText("👀  Viewer mode — join a session to watch")
+            QTimer.singleShot(300, self._open_session_for_viewer)
+        elif startup_mode == "clips":
+            # Clips mode: normal folder check
+            self._startup_clips_flow()
         else:
-            self.scan_folder()
-            self._update_status_bar()
+            # "ask" — show startup dialog
+            QTimer.singleShot(300, self._show_startup_dialog)
         
 
         # Auto-hide timer for controls
@@ -2000,6 +2166,39 @@ class VideoPlayer(QMainWindow):
             self.config_manager.set("clips_folder", folder)
             self.scan_folder()
             self._update_status_bar()
+
+    def _show_startup_dialog(self):
+        """Show the startup mode selection dialog."""
+        dlg = StartupDialog(self)
+        if dlg.exec() and dlg.chosen_mode:
+            if dlg.remember_cb.isChecked():
+                self.config_manager.set("startup_mode", dlg.chosen_mode)
+            if dlg.chosen_mode == "viewer":
+                self._viewer_only = True
+                self.video_label.setText("👀  Viewer mode — join a session to watch")
+                self._open_session_for_viewer()
+            else:
+                self._startup_clips_flow()
+        else:
+            # Dialog closed without choice — fall back to clips flow
+            self._startup_clips_flow()
+
+    def _startup_clips_flow(self):
+        """Normal startup: check clips folder, prompt if missing."""
+        if not self.clips_folder or not os.path.exists(self.clips_folder):
+            self.video_label.setText("⚠  Please select a clips folder to begin")
+            QTimer.singleShot(200, self.select_folder)
+        else:
+            self.scan_folder()
+            self._update_status_bar()
+
+    def _open_session_for_viewer(self):
+        """Open and show the session panel for viewer-only users."""
+        if self._session_panel:
+            self._session_panel.setVisible(True)
+            self._session_active = True
+            if hasattr(self, 'toggle_session_action'):
+                self.toggle_session_action.setChecked(True)
 
     def show_blocked_dialog(self):
         """Show dialog to manage blocked clips"""

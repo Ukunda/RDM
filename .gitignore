@@ -16,6 +16,11 @@ dist/
 *.manifest
 *.exe
 
+# Nuitka build artifacts
+*.build/
+*.dist/
+*.onefile-build/
+
 # Virtual environments
 venv/
 env/
