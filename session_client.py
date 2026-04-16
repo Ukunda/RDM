@@ -24,6 +24,8 @@ import websocket  # websocket-client library
 
 log = logging.getLogger("rdm-session")
 
+CHUNK_SIZE = 5 * 1024 * 1024  # 5MB — sweet spot for resumable uploads
+
 # ============================================================================
 # Session Client Signals (thread-safe communication with UI)
 # ============================================================================
@@ -689,7 +691,7 @@ class SessionClient:
     # ====================================================================
 
     def _upload_thread(self, filepath: str):
-        """Upload a video file, then tell the room to play it."""
+        """Upload a video file using resumable chunked upload, then tell the room to play it."""
         try:
             if not os.path.exists(filepath):
                 self.signals.room_error.emit(f"File not found: {filepath}")
@@ -697,45 +699,93 @@ class SessionClient:
 
             file_size = os.path.getsize(filepath)
             filename = os.path.basename(filepath)
+            base_url = f"{self._server_url}/rooms/{self._room_code}/upload"
 
-            # Upload with progress tracking
-            url = f"{self._server_url}/rooms/{self._room_code}/upload"
-
-            # Use a generator to track upload progress (throttled to ~20 updates/sec)
-            class ProgressFile:
-                def __init__(self, path, signals, total_size):
-                    self._file = open(path, "rb")
-                    self._signals = signals
-                    self._total = total_size
-                    self._sent = 0
-                    self._last_emit = 0.0
-
-                def read(self, size=-1):
-                    data = self._file.read(size)
-                    self._sent += len(data)
-                    now = time.monotonic()
-                    if now - self._last_emit >= 0.05 or self._sent >= self._total:
-                        self._signals.upload_progress.emit(self._sent, self._total)
-                        self._last_emit = now
-                    return data
-
-                def __getattr__(self, name):
-                    return getattr(self._file, name)
-
-            progress_file = ProgressFile(filepath, self.signals, file_size)
-
+            # --- Phase 1: Init ---
             resp = requests.post(
-                url,
-                data={"user_id": self._user_id},
-                files={"file": (filename, progress_file, "application/octet-stream")},
-                timeout=600,  # 10 minute timeout for large files
+                f"{base_url}/init",
+                json={
+                    "user_id": self._user_id,
+                    "filename": filename,
+                    "file_size": file_size,
+                    "chunk_size": CHUNK_SIZE,
+                },
+                timeout=30,
             )
-
-            progress_file._file.close()
-
             if resp.status_code != 200:
                 error = resp.json().get("detail", resp.text)
-                self.signals.room_error.emit(f"Upload failed: {error}")
+                self.signals.room_error.emit(f"Upload init failed: {error}")
+                return
+
+            init_data = resp.json()
+            upload_id = init_data["upload_id"]
+            total_chunks = init_data["total_chunks"]
+
+            # --- Phase 2: Upload chunks with retry + resume ---
+            bytes_sent = 0
+            start_index = 0
+
+            with open(filepath, "rb") as f:
+                for chunk_idx in range(start_index, total_chunks):
+                    f.seek(chunk_idx * CHUNK_SIZE)
+                    chunk_data = f.read(CHUNK_SIZE)
+                    if not chunk_data:
+                        break
+
+                    # Retry each chunk up to 3 times
+                    for attempt in range(3):
+                        try:
+                            chunk_resp = requests.put(
+                                f"{base_url}/{upload_id}/chunk/{chunk_idx}",
+                                data=chunk_data,
+                                headers={"Content-Type": "application/octet-stream"},
+                                timeout=120,
+                            )
+                            if chunk_resp.status_code == 200:
+                                break
+                            error = chunk_resp.json().get("detail", chunk_resp.text)
+                            log.warning(f"Chunk {chunk_idx} failed (attempt {attempt+1}): {error}")
+                        except requests.ConnectionError:
+                            log.warning(f"Chunk {chunk_idx} connection error (attempt {attempt+1})")
+                            if attempt < 2:
+                                # Resume: ask server where we left off
+                                time.sleep(2 ** attempt)
+                                try:
+                                    status_resp = requests.get(
+                                        f"{base_url}/{upload_id}/status",
+                                        timeout=15,
+                                    )
+                                    if status_resp.status_code == 200:
+                                        status = status_resp.json()
+                                        bytes_sent = status["received_bytes"]
+                                        self.signals.upload_progress.emit(bytes_sent, file_size)
+                                except Exception:
+                                    pass
+                                continue
+                            self.signals.room_error.emit("Upload failed: connection lost")
+                            return
+                        except requests.Timeout:
+                            log.warning(f"Chunk {chunk_idx} timeout (attempt {attempt+1})")
+                            if attempt == 2:
+                                self.signals.room_error.emit("Upload failed: timeout")
+                                return
+                            time.sleep(2 ** attempt)
+                    else:
+                        # All 3 attempts failed for non-exception case
+                        self.signals.room_error.emit(f"Upload failed at chunk {chunk_idx}")
+                        return
+
+                    bytes_sent += len(chunk_data)
+                    self.signals.upload_progress.emit(bytes_sent, file_size)
+
+            # --- Phase 3: Complete ---
+            resp = requests.post(
+                f"{base_url}/{upload_id}/complete",
+                timeout=120,
+            )
+            if resp.status_code != 200:
+                error = resp.json().get("detail", resp.text)
+                self.signals.room_error.emit(f"Upload finalize failed: {error}")
                 return
 
             data = resp.json()

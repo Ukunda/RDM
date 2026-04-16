@@ -46,6 +46,7 @@ UPLOAD_DIR = Path(os.getenv("RDM_UPLOAD_DIR", "./uploads"))
 MAX_FILE_SIZE = int(os.getenv("RDM_MAX_FILE_SIZE_MB", "500")) * 1024 * 1024  # bytes
 ROOM_EXPIRY_SECONDS = int(os.getenv("RDM_ROOM_EXPIRY_SECONDS", "14400"))  # 4 hours
 CLEANUP_INTERVAL = 300  # 5 minutes
+UPLOAD_STALE_SECONDS = 1800  # 30 minutes — incomplete chunked uploads older than this get cleaned up
 MAX_JOIN_ATTEMPTS = 5
 JOIN_LOCKOUT_SECONDS = 60
 
@@ -56,6 +57,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("rdm-server")
+
+ALLOWED_EXTENSIONS = {
+    '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv',
+    '.webm', '.m4v', '.mpeg', '.mpg', '.3gp', '.ts', '.mts',
+}
 
 # ============================================================================
 # Data Models
@@ -86,6 +92,7 @@ class Room:
     pending_video: Optional[str] = None                  # video_id waiting for all users to be ready
     ready_users: set = field(default_factory=set)         # user_ids that reported ready for pending_video
     pending_random_request: Optional[dict] = None        # {target_uid, requester_uid, tried: []}
+    pending_uploads: dict = field(default_factory=dict)  # upload_id -> chunked upload metadata
     playback_state: dict = field(default_factory=lambda: {
         "playing": False,
         "position": 0.0,       # 0.0 - 1.0
@@ -193,6 +200,20 @@ class ServerState:
                 stale_ips.append(ip)
         for ip in stale_ips:
             del self.join_attempts[ip]
+
+        # Clean up stale chunked uploads (>30min) in active rooms
+        now = time.time()
+        for code, room in list(self.rooms.items()):
+            stale = [
+                uid for uid, info in room.pending_uploads.items()
+                if now - info["started_at"] > UPLOAD_STALE_SECONDS
+            ]
+            for uid in stale:
+                info = room.pending_uploads.pop(uid)
+                chunks_dir = Path(info["chunks_dir"])
+                if chunks_dir.exists():
+                    await asyncio.to_thread(shutil.rmtree, str(chunks_dir), True)
+                log.info(f"Cleaned up stale chunked upload {uid} in room {code}")
 
 
 state = ServerState()
@@ -320,7 +341,6 @@ async def upload_video(
     room.touch()
 
     # Validate file extension
-    ALLOWED_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpeg', '.mpg', '.3gp', '.ts', '.mts'}
     ext = Path(file.filename or "").suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {ext}")
@@ -378,6 +398,173 @@ async def upload_video(
     log.info(f"Video uploaded: {file.filename} ({total_size // 1024}KB) to room {room_code}")
 
     return {"video_id": video_id, "filename": file.filename, "size": total_size}
+
+
+# ----------------------------------------------------------------------------
+# Chunked Upload Endpoints (resumable)
+# ----------------------------------------------------------------------------
+
+@app.post("/rooms/{room_code}/upload/init")
+async def init_chunked_upload(room_code: str, request: Request):
+    """Initialize a resumable chunked upload. Returns an upload_id."""
+    body = await request.json()
+    user_id = body.get("user_id")
+    filename = body.get("filename", "")
+    file_size = body.get("file_size", 0)
+    chunk_size = body.get("chunk_size", 5 * 1024 * 1024)
+
+    if room_code not in state.rooms:
+        raise HTTPException(404, "Room not found")
+    room = state.rooms[room_code]
+    if user_id not in room.users:
+        raise HTTPException(403, "Not a member of this room")
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)")
+    if file_size <= 0:
+        raise HTTPException(400, "Invalid file size")
+
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported file type: {ext}")
+
+    upload_id = secrets.token_hex(8)
+    chunks_dir = UPLOAD_DIR / room_code / "chunks" / upload_id
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    total_chunks = (file_size + chunk_size - 1) // chunk_size
+
+    room.pending_uploads[upload_id] = {
+        "user_id": user_id,
+        "filename": filename,
+        "file_size": file_size,
+        "chunk_size": chunk_size,
+        "total_chunks": total_chunks,
+        "chunks_dir": str(chunks_dir),
+        "started_at": time.time(),
+        "received_chunks": set(),
+        "received_bytes": 0,
+    }
+    room.touch()
+
+    log.info(f"Chunked upload init: {filename} ({file_size // 1024}KB, {total_chunks} chunks) in room {room_code}")
+    return {"upload_id": upload_id, "chunk_size": chunk_size, "total_chunks": total_chunks}
+
+
+@app.put("/rooms/{room_code}/upload/{upload_id}/chunk/{index}")
+async def upload_chunk(room_code: str, upload_id: str, index: int, request: Request):
+    """Upload a single chunk of a resumable upload."""
+    if room_code not in state.rooms:
+        raise HTTPException(404, "Room not found")
+    room = state.rooms[room_code]
+    upload = room.pending_uploads.get(upload_id)
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+    if index < 0 or index >= upload["total_chunks"]:
+        raise HTTPException(400, f"Invalid chunk index: {index}")
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "Empty chunk")
+
+    if upload["received_bytes"] + len(body) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)")
+
+    chunk_path = Path(upload["chunks_dir"]) / f"{index:06d}.part"
+    async with aiofiles.open(chunk_path, "wb") as f:
+        await f.write(body)
+
+    if index not in upload["received_chunks"]:
+        upload["received_chunks"].add(index)
+        upload["received_bytes"] += len(body)
+
+    room.touch()
+    return {"index": index, "received_bytes": len(body)}
+
+
+@app.get("/rooms/{room_code}/upload/{upload_id}/status")
+async def upload_status(room_code: str, upload_id: str):
+    """Get the status of a chunked upload for resume support."""
+    if room_code not in state.rooms:
+        raise HTTPException(404, "Room not found")
+    room = state.rooms[room_code]
+    upload = room.pending_uploads.get(upload_id)
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+
+    received = sorted(upload["received_chunks"])
+    last_index = received[-1] if received else -1
+
+    return {
+        "upload_id": upload_id,
+        "last_chunk_index": last_index,
+        "received_chunks": len(received),
+        "total_chunks": upload["total_chunks"],
+        "received_bytes": upload["received_bytes"],
+        "expected_bytes": upload["file_size"],
+    }
+
+
+@app.post("/rooms/{room_code}/upload/{upload_id}/complete")
+async def complete_chunked_upload(room_code: str, upload_id: str):
+    """Merge all chunks into the final file and broadcast video_uploaded."""
+    if room_code not in state.rooms:
+        raise HTTPException(404, "Room not found")
+    room = state.rooms[room_code]
+    upload = room.pending_uploads.get(upload_id)
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+
+    expected = set(range(upload["total_chunks"]))
+    if upload["received_chunks"] != expected:
+        missing = sorted(expected - upload["received_chunks"])
+        raise HTTPException(400, f"Missing {len(missing)} chunk(s)")
+
+    video_id = upload_id
+    safe_filename = f"{video_id}_{upload['filename']}"
+    room_dir = UPLOAD_DIR / room_code
+    filepath = room_dir / safe_filename
+    chunks_dir = Path(upload["chunks_dir"])
+
+    try:
+        async with aiofiles.open(filepath, "wb") as out:
+            for i in range(upload["total_chunks"]):
+                chunk_path = chunks_dir / f"{i:06d}.part"
+                async with aiofiles.open(chunk_path, "rb") as cf:
+                    while True:
+                        data = await cf.read(262144)  # 256KB
+                        if not data:
+                            break
+                        await out.write(data)
+    except Exception as e:
+        filepath.unlink(missing_ok=True)
+        raise HTTPException(500, f"Failed to merge chunks: {e}")
+    finally:
+        await asyncio.to_thread(shutil.rmtree, str(chunks_dir), True)
+
+    del room.pending_uploads[upload_id]
+
+    room.videos[video_id] = {
+        "filename": upload["filename"],
+        "safe_filename": safe_filename,
+        "size": upload["received_bytes"],
+        "uploaded_by": upload["user_id"],
+        "uploaded_at": time.time(),
+    }
+
+    uploader = room.users.get(upload["user_id"])
+    uploader_name = uploader.username if uploader else "Unknown"
+    await broadcast(room, {
+        "type": "video_uploaded",
+        "video_id": video_id,
+        "filename": upload["filename"],
+        "size": upload["received_bytes"],
+        "uploaded_by": uploader_name,
+    })
+
+    log.info(f"Chunked upload complete: {upload['filename']} ({upload['received_bytes'] // 1024}KB) to room {room_code}")
+    room.touch()
+
+    return {"video_id": video_id, "filename": upload["filename"], "size": upload["received_bytes"]}
 
 
 @app.get("/rooms/{room_code}/videos/{video_id}")
