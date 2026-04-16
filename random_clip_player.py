@@ -2088,6 +2088,11 @@ class SessionPanel(QFrame):
         if self._player and hasattr(self._player, '_transfer_overlay'):
             self._player._transfer_overlay.finish()
 
+        # Prefetch downloads complete silently — don't interrupt playback
+        if self._player and video_id == self._player._prefetch_video_id:
+            QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+            return
+
         phase = self._player._session_phase if self._player else SessionPhase.IDLE
         phase_vid = self._player._phase_video_id if self._player else None
 
@@ -2257,7 +2262,7 @@ class SessionPanel(QFrame):
 
 def _parse_version(tag: str) -> tuple:
     """Parse a version tag like 'v1.2.3' or '1.2' into a comparable tuple."""
-    tag = tag.strip().lstrip("vV")
+    tag = tag.strip().lstrip("vV").split("-")[0]  # Strip pre-release suffix
     parts = []
     for p in tag.split("."):
         try:
@@ -3287,6 +3292,8 @@ class VideoPlayer(QMainWindow):
             self.status_label.setText(self._operation_status)
             return
         self._playing_remote_clip = False
+        self._prefetch_video_id = None
+        self._prefetch_timer.stop()
         if self.queue_index > 0:
             self.queue_index -= 1
             self.current_video = self.play_queue[self.queue_index]
@@ -3500,9 +3507,6 @@ class VideoPlayer(QMainWindow):
             if client and not client.is_host:
                 self.play_btn.setText("▶  Play")
                 self.status_label.setText("⏳ Waiting for host...")
-            elif client and self._playing_remote_clip:
-                # We were playing someone else's clip — host triggers next
-                QTimer.singleShot(50, self.play_random_clip)
             else:
                 QTimer.singleShot(50, self.play_random_clip)
         else:
@@ -3594,6 +3598,9 @@ class VideoPlayer(QMainWindow):
             return
         self.player.stop()
         self._operation_status = ""  # Clear any persistent operation status
+        self._prefetch_video_id = None
+        self._heartbeat_timer.stop()
+        self._prefetch_timer.stop()
         self.play_btn.setText("▶  Play")
         self.time_slider.setValue(0)
         self.time_label.setText("0:00")
@@ -4188,6 +4195,8 @@ class VideoPlayer(QMainWindow):
         """Another user wants to play a video — download it."""
         if DEBUG_MODE:
             logging.getLogger("rdm").debug(f"Remote PLAY_VIDEO from {username}: {filename} (id={video_id})")
+        self._prefetch_video_id = None
+        self._prefetch_timer.stop()
         self.status_label.setText(f"📥 {username} is sharing: {filename}")
         client = self._get_session_client()
         if client:
@@ -4224,6 +4233,13 @@ class VideoPlayer(QMainWindow):
         self.hide_controls_timer.stop()
         if hasattr(self, '_controls_animation'):
             self._controls_animation.stop()
+        # Stop session timers
+        if hasattr(self, '_phase_timeout_timer'):
+            self._phase_timeout_timer.stop()
+        if hasattr(self, '_heartbeat_timer'):
+            self._heartbeat_timer.stop()
+        if hasattr(self, '_prefetch_timer'):
+            self._prefetch_timer.stop()
         # Clean up session
         if self._session_panel:
             self._session_panel.cleanup()

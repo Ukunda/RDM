@@ -348,7 +348,8 @@ async def upload_video(
 
     # Generate a unique video ID
     video_id = secrets.token_hex(8)
-    safe_filename = f"{video_id}_{file.filename}"
+    safe_name = Path(file.filename or "unknown").name  # Strip directory components
+    safe_filename = f"{video_id}_{safe_name}"
     room_dir = UPLOAD_DIR / room_code
     room_dir.mkdir(parents=True, exist_ok=True)
     filepath = room_dir / safe_filename
@@ -365,8 +366,6 @@ async def upload_video(
                     break
                 total_size += len(chunk)
                 if total_size > MAX_FILE_SIZE:
-                    await f.close()
-                    filepath.unlink(missing_ok=True)
                     raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)")
                 await f.write(chunk)
     except Exception as e:
@@ -410,7 +409,7 @@ async def init_chunked_upload(room_code: str, request: Request):
     """Initialize a resumable chunked upload. Returns an upload_id."""
     body = await request.json()
     user_id = body.get("user_id")
-    filename = body.get("filename", "")
+    filename = Path(body.get("filename", "unknown")).name  # Strip directory components
     file_size = body.get("file_size", 0)
     chunk_size = body.get("chunk_size", 5 * 1024 * 1024)
 
@@ -521,7 +520,8 @@ async def complete_chunked_upload(room_code: str, upload_id: str):
         raise HTTPException(400, f"Missing {len(missing)} chunk(s)")
 
     video_id = upload_id
-    safe_filename = f"{video_id}_{upload['filename']}"
+    safe_name = Path(upload['filename']).name  # Strip directory components
+    safe_filename = f"{video_id}_{safe_name}"
     room_dir = UPLOAD_DIR / room_code
     filepath = room_dir / safe_filename
     chunks_dir = Path(upload["chunks_dir"])
@@ -597,10 +597,15 @@ async def stream_video(room_code: str, video_id: str, request: Request):
 
     if range_header:
         # Parse range request
-        range_val = range_header.strip().replace("bytes=", "")
-        range_parts = range_val.split("-")
-        start = int(range_parts[0]) if range_parts[0] else 0
-        end = int(range_parts[1]) if range_parts[1] else file_size - 1
+        try:
+            range_val = range_header.strip().replace("bytes=", "")
+            range_parts = range_val.split("-")
+            start = int(range_parts[0]) if range_parts[0] else 0
+            end = int(range_parts[1]) if len(range_parts) > 1 and range_parts[1] else file_size - 1
+        except (ValueError, IndexError):
+            raise HTTPException(416, "Invalid range header")
+        if start < 0 or start >= file_size or end < start:
+            raise HTTPException(416, "Range not satisfiable")
         end = min(end, file_size - 1)
         content_length = end - start + 1
 
@@ -650,7 +655,7 @@ async def stream_video(room_code: str, video_id: str, request: Request):
 # WebSocket — Real-time Signaling
 # ============================================================================
 
-async def broadcast(room: Room, message: dict, exclude_id: str = None):
+async def broadcast(room: Room, message: dict, exclude_id: Optional[str] = None):
     """Send a message to all users in a room, optionally excluding one."""
     data = json.dumps(message)
     disconnected = []
@@ -801,7 +806,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
         # Register user in room
         user = User(user_id=user_id, username=username, websocket=websocket)
         room.users[user_id] = user
-        room.pool_opted_in.setdefault(user_id, True)  # Default to opted-in
+        room.pool_opted_in.setdefault(user_id, {"opted_in": True, "count": 0})  # Default to opted-in
         room.touch()
 
         # Send current room state
@@ -881,6 +886,10 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                     req = room.pending_random_request
                     if req and req.get("target_uid") == user_id:
                         room.pending_random_request = None
+                    # Clear pending prefetch request if this user was the target
+                    pf = room.pending_prefetch_request
+                    if pf and pf.get("target_uid") == user_id:
+                        room.pending_prefetch_request = None
                     # Reject if a transition is already in progress
                     if room.pending_video is not None:
                         await websocket.send_json({
@@ -1039,10 +1048,11 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                             ]
                     if eligible:
                         target_uid = random.choice(eligible)
+                        tried = []
                         room.pending_random_request = {
                             "target_uid": target_uid,
                             "requester_uid": user_id,
-                            "tried": [],
+                            "tried": tried,
                         }
                         target = room.users.get(target_uid)
                         if target:
@@ -1053,7 +1063,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                                 })
                             except Exception:
                                 pass
-                        asyncio.create_task(_random_request_timeout(room, target_uid, user_id, []))
+                        asyncio.create_task(_random_request_timeout(room, target_uid, user_id, tried))
                     else:
                         await websocket.send_json({
                             "type": "random_failed",
@@ -1083,19 +1093,21 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                     ]
                     if eligible:
                         target_uid = random.choice(eligible)
-                        room.pending_prefetch_request = {"target_uid": target_uid, "tried": []}
+                        tried = []
+                        room.pending_prefetch_request = {"target_uid": target_uid, "tried": tried}
                         target = room.users.get(target_uid)
                         if target:
                             try:
                                 await target.websocket.send_json({"type": "provide_prefetch_clip"})
                             except Exception:
                                 pass
-                        asyncio.create_task(_prefetch_request_timeout(room, target_uid, []))
+                        asyncio.create_task(_prefetch_request_timeout(room, target_uid, tried))
 
             elif msg_type == "prefetch_uploaded":
                 # Provider finished prefetch upload — broadcast to all clients
                 video_id = data.get("video_id")
-                if video_id and video_id in room.videos:
+                pf = room.pending_prefetch_request
+                if video_id and video_id in room.videos and pf and pf.get("target_uid") == user_id:
                     room.pending_prefetch_request = None
                     filename = room.videos[video_id]["filename"]
                     await broadcast(room, {
@@ -1134,6 +1146,11 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
             req = room.pending_random_request
             if req and req.get("target_uid") == user_id:
                 room.pending_random_request = None  # Timeout task will handle retry
+
+            # Clean up pending prefetch request if this user was the target
+            pf_req = room.pending_prefetch_request
+            if pf_req and pf_req.get("target_uid") == user_id:
+                room.pending_prefetch_request = None
 
             # Notify remaining users
             await broadcast(room, {

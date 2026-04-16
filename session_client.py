@@ -230,6 +230,8 @@ class SessionClient:
         self._connected = False
         self._room_code = None
         self._user_id = None
+        self._username = None
+        self._host_id = None
         self._videos.clear()
         self.cleanup()
 
@@ -704,7 +706,7 @@ class SessionClient:
             if self._reconnect_attempts < self._max_reconnect_attempts and self._room_code and self._server_url:
                 self._attempt_reconnect()
             else:
-                reason = close_msg or "Connection closed"
+                reason = str(close_msg or "Connection closed")
                 self.signals.disconnected.emit(reason)
 
     def _send(self, data: dict):
@@ -774,6 +776,8 @@ class SessionClient:
                                 break
                             error = chunk_resp.json().get("detail", chunk_resp.text)
                             log.warning(f"Chunk {chunk_idx} failed (attempt {attempt+1}): {error}")
+                            if attempt < 2:
+                                time.sleep(2 ** attempt)
                         except requests.ConnectionError:
                             log.warning(f"Chunk {chunk_idx} connection error (attempt {attempt+1})")
                             if attempt < 2:
@@ -787,7 +791,8 @@ class SessionClient:
                                     if status_resp.status_code == 200:
                                         status = status_resp.json()
                                         bytes_sent = status["received_bytes"]
-                                        self.signals.upload_progress.emit(bytes_sent, file_size)
+                                        if not prefetch:
+                                            self.signals.upload_progress.emit(bytes_sent, file_size)
                                 except Exception:
                                     pass
                                 continue
@@ -804,8 +809,9 @@ class SessionClient:
                         self.signals.room_error.emit(f"Upload failed at chunk {chunk_idx}")
                         return
 
-                    bytes_sent += len(chunk_data)
-                    self.signals.upload_progress.emit(bytes_sent, file_size)
+                    bytes_sent = min((chunk_idx + 1) * CHUNK_SIZE, file_size)
+                    if not prefetch:
+                        self.signals.upload_progress.emit(bytes_sent, file_size)
 
             # --- Phase 3: Complete ---
             resp = requests.post(
@@ -828,12 +834,12 @@ class SessionClient:
             }
 
             if prefetch:
-                # Prefetch mode: notify server but don't trigger play_video
+                # Prefetch mode: notify server but don't trigger play_video or UI
                 self.send_prefetch_uploaded(video_id)
             else:
                 # Tell room to play this video (server starts ready-sync)
                 self.send_play_video(video_id)
-            self.signals.video_ready.emit(video_id, filepath)
+                self.signals.video_ready.emit(video_id, filepath)
 
         except Exception as e:
             log.error(f"Upload error: {e}")
