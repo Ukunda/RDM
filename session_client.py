@@ -72,6 +72,9 @@ class SessionSignals(QObject):
     random_clip_requested = Signal()              # Server wants us to share a random clip
     shared_pool_changed = Signal(bool, str)       # (enabled, changed_by)
 
+    # Transition lock — server rejected play_video because one is already pending
+    transition_busy = Signal(str)                 # (message)
+
     # Ping
     ping_result = Signal(int)                   # (latency_ms)
 
@@ -611,6 +614,9 @@ class SessionClient:
 
             elif msg_type == "error":
                 self.signals.room_error.emit(data.get("message", "Unknown error"))
+
+            elif msg_type == "transition_busy":
+                self.signals.transition_busy.emit(data.get("message", "A clip is already being loaded."))
 
         except json.JSONDecodeError:
             log.warning(f"Invalid JSON from server: {message[:100]}")

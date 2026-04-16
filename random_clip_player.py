@@ -1459,6 +1459,9 @@ class SessionPanel(QFrame):
             c.random_clip_requested.connect(self._player._on_random_clip_requested)
         c.shared_pool_changed.connect(self._on_shared_pool_changed)
 
+        # Transition lock — server rejected our play_video because one is pending
+        c.transition_busy.connect(self._on_transition_busy)
+
         # Playback signals → forwarded to VideoPlayer (and logged in activity)
         if self._player:
             c.remote_play.connect(self._on_activity_play)
@@ -1612,6 +1615,18 @@ class SessionPanel(QFrame):
         self.connection_status.setStyleSheet(f"color: {COLORS['accent_red']}; font-size: 10px; border: none;")
         # Clear uploading flag on error so user can try again
         if self._player:
+            self._player._session_uploading = False
+
+    def _on_transition_busy(self, msg):
+        """Server rejected our play_video — another transition is in progress."""
+        self.add_activity(f"⏳ {msg}")
+        self.progress_label.setText(f"⏳ {msg}")
+        QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+        # Reset uploading state so user can retry
+        if self._player:
+            self._player._session_uploading = False
+            self._player.status_label.setText(f"⏳ {msg}")
+            QTimer.singleShot(3000, self._player._update_status_bar)
             self._player._session_uploading = False
 
     def _show_disconnected(self, reason=""):

@@ -598,6 +598,15 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
             elif msg_type == "play_video":
                 video_id = data.get("video_id")
                 if video_id and video_id in room.videos:
+                    # Reject if a transition is already in progress
+                    if room.pending_video is not None:
+                        await websocket.send_json({
+                            "type": "transition_busy",
+                            "message": "A clip is already being loaded. Please wait.",
+                            "pending_video_id": room.pending_video,
+                        })
+                        log.info(f"Rejected play_video {video_id} — transition in progress for {room.pending_video} in room {room_code}")
+                        continue
                     room.current_video = video_id
                     # Start ready-sync: pause playback, tell everyone to download
                     room.playback_state["playing"] = False
