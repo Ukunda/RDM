@@ -82,9 +82,10 @@ class Room:
     current_video: Optional[str] = None                # video_id of active clip
     videos: dict = field(default_factory=dict)          # video_id -> file metadata
     shared_pool: bool = False                           # Shared random pool mode
-    pool_opted_in: dict = field(default_factory=dict)   # user_id -> bool (per-user pool opt-in)
+    pool_opted_in: dict = field(default_factory=dict)   # user_id -> {"opted_in": bool, "count": int}
     pending_video: Optional[str] = None                  # video_id waiting for all users to be ready
     ready_users: set = field(default_factory=set)         # user_ids that reported ready for pending_video
+    pending_random_request: Optional[dict] = None        # {target_uid, requester_uid, tried: []}
     playback_state: dict = field(default_factory=lambda: {
         "playing": False,
         "position": 0.0,       # 0.0 - 1.0
@@ -486,10 +487,69 @@ async def _ready_timeout(room: Room, video_id: str, timeout: float):
         room.playback_state["playing"] = True
         room.playback_state["position"] = 0.0
         room.playback_state["timestamp"] = time.time()
+        uploaded_by = room.videos.get(video_id, {}).get("uploaded_by", "")
         await broadcast(room, {
             "type": "all_ready",
             "video_id": video_id,
+            "uploaded_by": uploaded_by,
         })
+
+
+async def _random_request_timeout(room: Room, target_uid: str, requester_uid: str, tried: list):
+    """Timeout for random clip request — retry with another user or fail."""
+    await asyncio.sleep(10.0)
+    req = room.pending_random_request
+    if not req or req.get("target_uid") != target_uid:
+        return  # Request was fulfilled or cancelled
+    tried.append(target_uid)
+    if len(tried) >= 3:
+        # Max retries exceeded — notify requester
+        room.pending_random_request = None
+        requester = room.users.get(requester_uid)
+        if requester:
+            try:
+                await requester.websocket.send_json({
+                    "type": "random_failed",
+                    "message": "Kein User konnte einen Clip liefern",
+                })
+            except Exception:
+                pass
+        return
+    # Try next eligible user
+    eligible = [
+        uid for uid, info in room.pool_opted_in.items()
+        if isinstance(info, dict) and info.get("opted_in") and info.get("count", 0) > 0
+        and uid in room.users and uid not in tried and not info.get("exhausted")
+    ]
+    if not eligible:
+        room.pending_random_request = None
+        requester = room.users.get(requester_uid)
+        if requester:
+            try:
+                await requester.websocket.send_json({
+                    "type": "random_failed",
+                    "message": "Kein User konnte einen Clip liefern",
+                })
+            except Exception:
+                pass
+        return
+    next_uid = random.choice(eligible)
+    room.pending_random_request = {
+        "target_uid": next_uid,
+        "requester_uid": requester_uid,
+        "tried": tried,
+    }
+    target = room.users.get(next_uid)
+    if target:
+        try:
+            requester_name = room.users.get(requester_uid)
+            await target.websocket.send_json({
+                "type": "provide_random_clip",
+                "requested_by": requester_name.username if requester_name else "Unknown",
+            })
+        except Exception:
+            pass
+    asyncio.create_task(_random_request_timeout(room, next_uid, requester_uid, tried))
 
 
 @app.websocket("/ws/{room_code}")
@@ -600,6 +660,10 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
             elif msg_type == "play_video":
                 video_id = data.get("video_id")
                 if video_id and video_id in room.videos:
+                    # Clear pending random request if this is the response
+                    req = room.pending_random_request
+                    if req and req.get("target_uid") == user_id:
+                        room.pending_random_request = None
                     # Reject if a transition is already in progress
                     if room.pending_video is not None:
                         await websocket.send_json({
@@ -625,6 +689,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                         "timestamp": room.playback_state["timestamp"],
                     }, exclude_id=user_id)
                     # Check if sharer is the only user — start immediately
+                    uploaded_by = room.videos[video_id].get("uploaded_by", "")
                     if len(room.users) <= 1:
                         room.pending_video = None
                         room.playback_state["playing"] = True
@@ -632,6 +697,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                         await websocket.send_json({
                             "type": "all_ready",
                             "video_id": video_id,
+                            "uploaded_by": uploaded_by,
                         })
                     else:
                         log.info(f"Ready-sync started for {video_id} in room {room_code} (1/{len(room.users)} ready)")
@@ -659,9 +725,11 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                         room.playback_state["playing"] = True
                         room.playback_state["position"] = 0.0
                         room.playback_state["timestamp"] = time.time()
+                        uploaded_by = room.videos.get(ready_video_id, {}).get("uploaded_by", "")
                         await broadcast(room, {
                             "type": "all_ready",
                             "video_id": ready_video_id,
+                            "uploaded_by": uploaded_by,
                         })
                         log.info(f"All ready! Playback started for {ready_video_id} in room {room_code}")
 
@@ -710,41 +778,83 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
 
             elif msg_type == "pool_opt_in":
                 opted_in = data.get("opted_in", True)
-                room.pool_opted_in[user_id] = opted_in
+                clip_count = data.get("clip_count", 0)
+                room.pool_opted_in[user_id] = {"opted_in": opted_in, "count": clip_count}
                 await broadcast(room, {
                     "type": "pool_opt_in_changed",
                     "user_id": user_id,
                     "username": username,
                     "opted_in": opted_in,
                 })
-                log.info(f"Pool opt-in for '{username}' in room {room_code}: {opted_in}")
+                log.info(f"Pool opt-in for '{username}' in room {room_code}: {opted_in} (clips: {clip_count})")
 
             elif msg_type == "request_random":
                 # In shared pool mode, pick a random user to provide a clip
                 if room.shared_pool and len(room.users) > 0:
-                    # Filter to users who opted in to the pool
-                    eligible = [uid for uid in room.users if room.pool_opted_in.get(uid, True)]
+                    # Filter: opted_in=True AND count > 0 AND not exhausted
+                    eligible = [
+                        uid for uid, info in room.pool_opted_in.items()
+                        if isinstance(info, dict) and info.get("opted_in") and info.get("count", 0) > 0
+                        and uid in room.users and not info.get("exhausted")
+                    ]
+                    if not eligible:
+                        # Check if all exhausted → pool_reset
+                        all_exhausted = all(
+                            isinstance(info, dict) and info.get("exhausted")
+                            for uid, info in room.pool_opted_in.items()
+                            if isinstance(info, dict) and info.get("opted_in") and uid in room.users
+                        )
+                        if all_exhausted and any(
+                            isinstance(info, dict) and info.get("opted_in") and uid in room.users
+                            for uid, info in room.pool_opted_in.items()
+                        ):
+                            # Reset all exhausted flags
+                            for uid, info in room.pool_opted_in.items():
+                                if isinstance(info, dict):
+                                    info["exhausted"] = False
+                            await broadcast(room, {"type": "pool_reset"})
+                            log.info(f"Pool reset in room {room_code} — all users exhausted")
+                            # Re-filter after reset
+                            eligible = [
+                                uid for uid, info in room.pool_opted_in.items()
+                                if isinstance(info, dict) and info.get("opted_in") and info.get("count", 0) > 0
+                                and uid in room.users
+                            ]
                     if eligible:
                         target_uid = random.choice(eligible)
+                        room.pending_random_request = {
+                            "target_uid": target_uid,
+                            "requester_uid": user_id,
+                            "tried": [],
+                        }
+                        target = room.users.get(target_uid)
+                        if target:
+                            try:
+                                await target.websocket.send_json({
+                                    "type": "provide_random_clip",
+                                    "requested_by": username,
+                                })
+                            except Exception:
+                                pass
+                        asyncio.create_task(_random_request_timeout(room, target_uid, user_id, []))
                     else:
-                        # No one opted in — fall back to requester
-                        target_uid = user_id
-                    target = room.users.get(target_uid)
-                    target = room.users.get(target_uid)
-                    if target:
-                        try:
-                            await target.websocket.send_json({
-                                "type": "provide_random_clip",
-                                "requested_by": username,
-                            })
-                        except Exception:
-                            pass
+                        await websocket.send_json({
+                            "type": "random_failed",
+                            "message": "Keine eligible User im Pool",
+                        })
                 else:
                     # Not in shared pool mode — just tell the requester to play their own
                     await websocket.send_json({
                         "type": "provide_random_clip",
                         "requested_by": username,
                     })
+
+            elif msg_type == "pool_exhausted":
+                # User's play queue is exhausted
+                info = room.pool_opted_in.get(user_id)
+                if isinstance(info, dict):
+                    info["exhausted"] = True
+                log.info(f"Pool exhausted for '{username}' in room {room_code}")
 
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -770,6 +880,11 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
             username = leaving_user.username if leaving_user else "Unknown"
 
             log.info(f"User '{username}' left room {room_code}")
+
+            # Clean up pending random request if this user was the target
+            req = room.pending_random_request
+            if req and req.get("target_uid") == user_id:
+                room.pending_random_request = None  # Timeout task will handle retry
 
             # Notify remaining users
             await broadcast(room, {

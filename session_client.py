@@ -62,7 +62,7 @@ class SessionSignals(QObject):
 
     # Ready-sync: server tells us to prepare a video, then signals all_ready
     prepare_video = Signal(str, str, str)         # (video_id, filename, username) — download & wait
-    all_ready = Signal(str)                       # (video_id) — everyone is ready, start playback
+    all_ready = Signal(str, str)                   # (video_id, uploaded_by) — everyone is ready, start playback
     ready_progress = Signal(int, int)             # (ready_count, total_count)
 
     # Sync on join
@@ -72,6 +72,8 @@ class SessionSignals(QObject):
     random_clip_requested = Signal()              # Server wants us to share a random clip
     shared_pool_changed = Signal(bool, str)       # (enabled, changed_by)
     pool_opt_in_changed = Signal(str, bool)       # (username, opted_in)
+    random_failed = Signal(str)                   # (message) — random request failed after retries
+    pool_reset = Signal()                         # All users exhausted, reshuffle queues
 
     # Transition lock — server rejected play_video because one is already pending
     transition_busy = Signal(str)                 # (message)
@@ -270,9 +272,13 @@ class SessionClient:
         """Host toggles shared random pool mode."""
         self._send({"type": "set_shared_pool", "enabled": enabled})
 
-    def send_pool_opt_in(self, opted_in: bool):
+    def send_pool_opt_in(self, opted_in: bool, clip_count: int = 0):
         """Tell the server whether our clips are available in the shared pool."""
-        self._send({"type": "pool_opt_in", "opted_in": opted_in})
+        self._send({"type": "pool_opt_in", "opted_in": opted_in, "clip_count": clip_count})
+
+    def send_pool_exhausted(self):
+        """Tell the server our play queue is exhausted."""
+        self._send({"type": "pool_exhausted"})
 
     def send_ping(self):
         """Send a ping to measure round-trip latency."""
@@ -593,7 +599,8 @@ class SessionClient:
             elif msg_type == "all_ready":
                 # Everyone has downloaded — start playback
                 video_id = data.get("video_id", "")
-                self.signals.all_ready.emit(video_id)
+                uploaded_by = data.get("uploaded_by", "")
+                self.signals.all_ready.emit(video_id, uploaded_by)
 
             elif msg_type == "ready_progress":
                 ready_count = data.get("ready", 0)
@@ -635,6 +642,12 @@ class SessionClient:
                     data.get("username", ""),
                     data.get("opted_in", True),
                 )
+
+            elif msg_type == "random_failed":
+                self.signals.random_failed.emit(data.get("message", "Random request failed"))
+
+            elif msg_type == "pool_reset":
+                self.signals.pool_reset.emit()
 
             elif msg_type == "error":
                 self.signals.room_error.emit(data.get("message", "Unknown error"))

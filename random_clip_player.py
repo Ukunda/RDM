@@ -1835,6 +1835,9 @@ class SessionPanel(QFrame):
             c.random_clip_requested.connect(self._player._on_random_clip_requested)
         c.shared_pool_changed.connect(self._on_shared_pool_changed)
         c.pool_opt_in_changed.connect(self._on_pool_opt_in_changed)
+        c.random_failed.connect(self._on_random_failed)
+        if self._player:
+            c.pool_reset.connect(self._player._on_pool_reset)
 
         # Transition lock — server rejected our play_video because one is pending
         c.transition_busy.connect(self._on_transition_busy)
@@ -2138,7 +2141,7 @@ class SessionPanel(QFrame):
         self.now_playing_label.setText(f"▶ {filename}")
         self.progress_label.setText(f"⬇ Downloading from {username}...")
 
-    def _on_all_ready(self, video_id):
+    def _on_all_ready(self, video_id, uploaded_by=""):
         """Everyone is ready — start playback from the beginning."""
         self.add_activity("✅ All synced — playing!")
         self.progress_label.setText("▶ Playing!")
@@ -2146,7 +2149,9 @@ class SessionPanel(QFrame):
         if self._player and self._player.player:
             self._player._session_uploading = False
             self._player._operation_status = ""  # Clear persistent status
-            self._player._playing_remote_clip = True  # Don't re-share when this clip ends
+            # Check if WE uploaded this clip — don't mark as remote if so
+            own_id = self.session_client.user_id if self.session_client else None
+            self._player._playing_remote_clip = (uploaded_by != own_id)
             self._player._ignore_remote = True
             self._player.player.seek(0, reference='absolute')
             self._player.player.pause = False
@@ -2195,12 +2200,19 @@ class SessionPanel(QFrame):
     def _on_pool_opt_in_toggled(self, checked):
         """User toggled their own pool opt-in."""
         if self.session_client and self.session_client.is_connected:
-            self.session_client.send_pool_opt_in(checked)
+            clip_count = len(self._player.play_queue) if self._player else 0
+            self.session_client.send_pool_opt_in(checked, clip_count)
 
     def _on_pool_opt_in_changed(self, username, opted_in):
         """Another user changed their pool opt-in status."""
         icon = "🎲" if opted_in else "—"
         self.add_activity(f"{icon} {username} {'joined' if opted_in else 'left'} the clip pool")
+
+    def _on_random_failed(self, message):
+        """Random clip request failed after retries."""
+        self.add_activity(f"⚠ {message}")
+        self.progress_label.setText(f"⚠ {message}")
+        QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
 
     def cleanup(self):
         if self.session_client:
@@ -3608,18 +3620,34 @@ class VideoPlayer(QMainWindow):
             self._refresh_queue()
         if not self.play_queue:
             self.status_label.setText("⚠ No clips to share")
+            # Notify server we're exhausted
+            client = self._get_session_client()
+            if client:
+                client.send_pool_exhausted()
             return
         # Pick a random clip and share it (don't play locally — wait for all_ready)
         self.queue_index += 1
         if self.queue_index >= len(self.play_queue):
-            random.shuffle(self.play_queue)
-            self.queue_index = 0
+            # Queue exhausted — notify server
+            client = self._get_session_client()
+            if client:
+                client.send_pool_exhausted()
+            self.status_label.setText("🎲 Meine Clips aufgebraucht")
+            return
         self.current_video = self.play_queue[self.queue_index]
         self._update_navigation_state()
         filename = os.path.basename(self.current_video)
         self.video_label.setText(f"⏳ Uploading: {filename}")
         self.status_label.setText("⏳ Syncing with session...")
         self._session_auto_share()
+
+    def _on_pool_reset(self):
+        """All users exhausted — reshuffle queue and start over."""
+        if self.play_queue:
+            random.shuffle(self.play_queue)
+        self.queue_index = -1
+        self.status_label.setText("🔄 Pool reset — reshuffled!")
+        QTimer.singleShot(2000, self._update_status_bar)
 
     def _update_session_dot(self, connected):
         """Update the session menu title with a green/grey dot."""
