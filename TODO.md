@@ -1,210 +1,309 @@
-Legende:
-  🟢 Einfach   — Hauptsächlich UI-Arbeit, wenig Risiko, kein Protokoll-Umbau
-  🟡 Mittel    — Erfordert Client+Server-Änderungen, moderate Komplexität
-  🔴 Komplex   — Tiefgreifende Architektur-Änderung, hohes Regressionsrisiko
-
 ═══════════════════════════════════════════════
   COMPLETED
 ═══════════════════════════════════════════════
 
-✅ Add options to change keybinds via menu 
-✅ Frame by frame skip via . and , button (changeable via keybind)
-✅ Toggle option for the "button bar" to auto-hide when cursor leaves 
-✅ Toggle in the dropdown menu to "show only favorites" 
-✅ Settings menu next to the file menu 
-✅ When scrolling over the slomo button change slow amount. If pressed it defaults to 0.5 
-✅ Drag buttons around to rearrange them (Alt+drag). Size stays the same 
-✅ PySide6 migration (was PyQt5) 
-✅ MPV integration (replaced VLC) 
-✅ Big update: "Watch Together" — session rooms, room codes, password protection,
-   playback sync (play/pause/seek/speed), clip upload & streaming, shared random pool,
-   ready-sync protocol, host-only autoplay, auto-reconnect, sync-on-join, ping display,
-   host kick, activity feed, connection status dot, debug mode (--debug). Server via Docker.
-✅ Fullscreen toggle (F11 or double-click video area)
-✅ scaletempo2 audio filter for pitch-correct speed changes
+✅ Keybinds, Frame-skip, Button-bar auto-hide, Favorites filter, Settings menu
+✅ Slomo scroll, Drag-to-rearrange buttons, PySide6 migration, MPV integration
+✅ Watch Together (rooms, sync, upload/stream, ready-sync, auto-reconnect, kick, etc.)
+✅ Fullscreen toggle, scaletempo2 audio filter
+✅ Slider seeking fix, Multiskip-Bug fix, Autoplay/Random bug fix
+✅ Startup-Dialog, Advanced Info & Status-Overhaul, Transfer Overlay (Stufe 1)
+✅ Pool Opt-In/Out pro User, Dislike Dual-Funktion (Blacklist + Trash)
 
 ═══════════════════════════════════════════════
-  BUGS — FIXED
+  1 — DESYNC-HEARTBEAT  (🟢 ~60 LOC)
 ═══════════════════════════════════════════════
 
-✅ Slider seeking fixed — time-pos observer now suppressed while slider is held,
-   seek only fires on release. ClickableSlider properly emits pressed/released.
+Problem: Nach all_ready gibt es keine Drift-Erkennung. Ein einziger
+Netzwerk-Hickup oder Seek-Rundungsfehler → Host und Gäste dauerhaft out-of-sync.
 
-✅ Multiskip-Bug fixed — server-side transition lock rejects play_video when a
-   pending_video transition is already in progress. Client shows "busy" feedback.
+Lösung:
+  Client (Host):
+  - QTimer alle 5s → _send_position_heartbeat()
+  - Sendet nur wenn: player existiert, nicht paused, in Session, _ignore_remote False
+  - WS: {"type": "position_heartbeat", "position": float, "speed": float}
+  - Timer starten bei all_ready, stoppen bei pause/disconnect/stop
 
-✅ Autoplay/Random bug fixed — explicit player.pause = False after play() to
-   prevent stale pause state from keep_open=True. Session load/ready-sync fixed.
+  Server:
+  - "position_heartbeat" → broadcast an alle AUSSER Sender (wie play/pause/seek)
+  - Kein serverseitiger State — reines Relay
 
-═══════════════════════════════════════════════
-  BUGS — HIGH PRIORITY
-═══════════════════════════════════════════════
+  Client (Gast):
+  - Signal position_heartbeat(float, float) auf SessionSignals
+  - Handler _on_position_heartbeat(position, speed):
+    - Eigene Position per self.player.time_pos lesen
+    - drift = abs(eigene_pos - host_pos)
+    - drift > 2.0s → _ignore_remote=True, player.seek(host_pos), _ignore_remote=False
+    - drift > 5.0s → zusätzlich kurze Statusmeldung "🔄 Sync korrigiert"
+    - drift < 0.5s → nichts tun (normaler Jitter)
+    - Speed-Abgleich: wenn host_speed != player.speed → korrigieren
 
-🐛🟡 Shared clip pool is buggy and needs a full rework. Current issues:
-   - Random user selection doesn't account for users with 0 clips
-   - No feedback when the selected user fails to provide a clip
-   - Race conditions when pool toggle and random request happen simultaneously
-   - No timeout/fallback if the chosen user disconnects mid-share
-   - Clips wiederholen sich wenn ein User weniger hat als andere: Bei z.B.
-     100 Clips (User A) und 50 Clips (User B) fängt User B nach 50 wieder
-     von vorne an, statt dass das System alle 150 einmalig abspielt.
-     Lösung: Server/Client trackt bereits gespielte Clips pro User. User
-     dessen Pool erschöpft ist wird bei der Random-Auswahl übersprungen bis
-     alle User durch sind. Erst dann Reset aller Pools.
-
-🐛🟡 Permanent uncertainty whether guests see the same thing as host during a session.
-   No periodic sync verification exists — once a desync happens (network hiccup, 
-   different decode speed, seek rounding) there is no way to detect or correct it.
-   Need: periodic position heartbeat from host, drift detection + correction on guests.
-
-🐛 Upload/Download-Geschwindigkeit & Transparenz bei großen Clips
-   Symptom: Große Videos (+500 MB) blockieren die Session. Upload/download
-   blocks the session and there's no progress gating — large files choke the
-   server and stall the ready-sync. User denken das Programm ist abgestürzt,
-   weil keine sichtbare Aktivität stattfindet.
-   Umsetzung (gestuft):
-   Stufe 1 — UX-Sofortmaßnahmen (🟢 einfach): ✅ DONE
-   - Prominenter Fortschrittsbalken im Video-Bereich (Overlay) statt nur im
-     Session-Panel. Zeigt: "Lade Video… 234 MB / 512 MB (45%) — 2.1 MB/s"
-   - Geschätzte Restzeit (ETA) anzeigen
-   - Pulsierender Rahmen oder Spinner im Video-Frame während Download
-   Stufe 2 — Transfer-Optimierung (🔴 komplex):
-   - Chunked Upload mit konfigurierbarer Chunk-Größe (aktuell: einzelner POST)
-   - Parallele Chunk-Downloads (2-3 gleichzeitige Connections)
-   - Server: Streaming-Response statt komplettes File im RAM halten
-   - Kompression für Signaling-Daten (nicht für Video-Daten)
-   - Konfigurierbare Dateigrößen-Warnung (z.B. >500 MB → Bestätigungsdialog)
-   Stufe 3 — Architektur (🔴 komplex, langfristig):
-   - Peer-to-Peer Transfer-Option (WebRTC DataChannel) für LAN-Sessions
-   - Server als Relay nur für WAN-Sessions
+  Bekannte Einschränkung: Heartbeat kompensiert Drift, VERHINDERT ihn nicht.
+  Ursache (decode-speed, netzwerk) bleibt. Akzeptabler Trade-off.
 
 ═══════════════════════════════════════════════
-  FEATURES — SESSION
+  2 — SHARED POOL: ROBUSTHEIT  (🟡)
 ═══════════════════════════════════════════════
 
-🔲🔴 Phase 3: Formal State Machine for Watch Together
-   - Define SessionState enum: DISCONNECTED, CONNECTING, LOBBY, UPLOADING, 
-     DOWNLOADING, WAITING_READY, PLAYING, ERROR
-   - Replace scattered boolean flags (_ignore_remote, _session_uploading, 
-     _playing_remote_clip, _pending_sync_video_id, _pending_prepare_video_id)
-   - Central state handler that rejects impossible transitions
-   - This will fix most of the session race condition bugs above
+Probleme (einzeln adressiert):
 
-✅ Individueller Pool-Opt-In/Out pro User
-   Beschreibung: Jeder User in der Session soll per Toggle entscheiden können,
-   ob die eigenen Clips im Shared Random Pool verfügbar sind oder nicht.
-   Der Toggle muss jederzeit während der Session umschaltbar sein.
-   Aktueller Stand: Nur der Host kann den gesamten Shared Pool global
-   an-/ausschalten. Es gibt keine Per-User-Granularität.
-   Umsetzung:
-   - Server: Pro User ein Flag pool_opted_in (default: True) im Room-State
-   - Server: Bei random-User-Auswahl nur User mit pool_opted_in=True berücksichtigen
-   - Client: Checkbox im Session-Panel: "🎲 Meine Clips im Pool"
-   - WebSocket-Event: "pool_opt_in" {user_id, opted_in} → Server broadcastet Update
-   - UI: Userliste zeigt Icon (🎲/—) neben Usernamen für Pool-Status
+  (a) User mit 0 Clips wird gewählt → keine Antwort, Session hängt
+  Fix:
+  - pool_opt_in Message erweitern: {"opted_in": bool, "clip_count": int}
+  - Server speichert clip_count in Room.pool_opted_in: {uid: {"opted_in": bool, "count": int}}
+  - request_random filtert: opted_in=True AND count > 0
+  - Client sendet clip_count = len(play_queue) beim Opt-In und bei jedem Rejoin
 
-🔲🔴 Video-Queue mit Prefetch-Buffering
-   Beschreibung: Im Session-Panel soll eine sichtbare Video-Queue angezeigt
-   werden. Das System soll bereits die nächsten 1-2 Videos im Hintergrund
-   herunterladen, damit der Übergang zwischen Clips nahtlos ist.
-   Disconnect-Button wird unter die Queue verschoben.
-   Aktueller Stand: Kein Queue-System. Jedes Video wird erst bei Bedarf
-   geladen. Zwischen Clips gibt es eine spürbare Wartezeit.
-   Umsetzung:
-   - Server: Neues Konzept "queue" pro Room — geordnete Liste von video_ids
-   - Server: Endpoint zum Queue-Management (add, remove, reorder, peek_next)
-   - Client: Queue-Widget im Session-Panel (scrollbare Liste, drag-to-reorder)
-   - Client: Background-Download-Thread für nächstes Video in der Queue
-   - Client: Prefetch-Cache (max 2 Videos vorgeladen, älteste verwerfen)
-   - Ready-Sync anpassen: Prefetch-Videos überspringen Ready-Download-Phase
-   Abhängigkeit: Profitiert von Phase 3 State Machine für saubere Transitions.
+  (b) Gewählter User disconnected oder antwortet nicht
+  Fix — Server-seitig:
+  - request_random speichert pending_random_request = {target_uid, requested_at, requester_uid}
+  - asyncio.create_task: 10s Timeout. Wenn kein play_video kommt:
+    → Nächsten eligible User wählen (ausschließlich des gescheiterten)
+    → Max 3 Versuche, dann Error-Message an Requester:
+      {"type": "random_failed", "message": "Kein User konnte einen Clip liefern"}
+  - play_video Handler: wenn pending_random_request vorhanden und sender==target → clear pending
+  Fix — Client-seitig:
+  - Nach send_request_random: Status "🎲 Warte auf Clip…" mit Spinner
+  - Neues Signal random_failed(str) → Statusmeldung + erneuter Random-Button Enabled
+  - Bestehender all_ready Handler räumt Status ohnehin auf
 
-✅ Startup-Dialog: "Zuschauen" vs. "Clips teilen"
-   Beschreibung: Beim Programmstart erscheint ein moderner Dialog mit zwei
-   Optionen: (A) "Ich möchte nur zuschauen" → Überspringt Ordnerauswahl,
-   öffnet direkt den Session-Beitritts-Dialog. (B) "Ich habe eigene Clips" →
-   Normaler Flow mit Ordnerauswahl.
-   Umsetzung:
-   - Neuer QDialog mit zwei großen Karten-Buttons (Icons + Beschreibung)
-   - Option A: Setzt internen Flag viewer_only=True, überspringt scan_folder(),
-     öffnet Session-Panel mit Join-Dialog
-   - Option B: Normaler Programmstart mit QFileDialog
-   - "Nicht erneut fragen"-Checkbox → Speichert Auswahl in config.json
-   - Einstellung zum Zurücksetzen unter Settings
+  (c) Clip-Wiederholung bei ungleichen Pool-Größen (100 vs 50 Clips)
+  Fix — Client-seitig (gewichtete Auswahl):
+  - _on_random_clip_requested: Wenn play_queue erschöpft → Status
+    "🎲 Meine Clips aufgebraucht" senden (neues WS-Event: pool_exhausted)
+  - Server: User mit pool_exhausted werden bei random-Auswahl übersprungen
+  - Server: Wenn ALLE User exhausted → broadcast pool_reset → Clients resetten play_queue
+  - Client: Bei pool_reset → play_queue reshufflen, queue_index = -1
+  Vorteil: Tracking bleibt client-seitig (Server kennt keine Clip-Listen),
+  nur ein Boolean "exhausted" wird synchronisiert.
+
+  (d) _playing_remote_clip Bug
+  Problem: _on_all_ready setzt _playing_remote_clip=True auch für den User
+  der den Clip SELBST geteilt hat. Folge: Like/Dislike für eigenen Clip disabled.
+  Fix: _on_all_ready prüft ob video_id in client._videos mit local_path existiert
+  (= wir haben den Clip hochgeladen). Wenn ja → _playing_remote_clip=False.
 
 ═══════════════════════════════════════════════
-  FEATURES — LOKAL / PLAYER
+  3 — SESSION STATE CONSOLIDATION  (🟡)
 ═══════════════════════════════════════════════
 
-🔲🟡 Auto-updater connected to GitHub Releases
-   - On startup (or on a timer), check GitHub API for latest release tag
-   - If newer than current version, show a popup with three buttons:
-     "Update now"  /  "Later"  /  "Nah I'm good"
-   - "Update now" → download the new .exe, replace self, restart
-   - "Later" → remind again next launch
-   - "Nah I'm good" → don't ask again for this version
-   - Store skipped version + "later" state in config.json
+Problem: 6 Booleans in VideoPlayer + 3 State-Felder in SessionPanel. Kein
+zentraler Überblick was die Session gerade tut. Bugs entstehen durch
+widersprüchliche Flag-Kombinationen.
 
-✅ Dislike-Button: Reaktivierung im Session-Modus + Dual-Funktion
-   Beschreibung: Der Dislike-Button (👎) soll im Session-Modus wieder aktiv
-   sein, aber ausgegraut wenn gerade ein externer Clip läuft (da man fremde
-   Clips nicht löschen/blocken kann). Zusätzlich bekommt der Button zwei Modi:
-   (1) Blacklisting (wie bisher) — Clip wird aus Rotation entfernt
-   (2) Direkte Löschung — Clip wird in den Papierkorb verschoben
-   Bei Entfernung des Dislikes wird der Clip wiederhergestellt.
-   Umsetzung:
-   - Settings: Neue Option "Dislike-Aktion" → Dropdown: "Blacklist" / "In Papierkorb"
-   - Blacklist-Modus: Wie bisher (config blocked_clips)
-   - Papierkorb-Modus: send2trash-Bibliothek nutzen, Original-Pfad in config
-     speichern (restore_map: {clip_name: original_path})
-   - Undo: Bei Dislike-Entfernung → Datei aus Papierkorb zurück an original_path
-     ⚠ Achtung: Papierkorb-Restore ist OS-abhängig und nicht immer zuverlässig.
-     Alternative: Eigener "Trash"-Ordner innerhalb des Clip-Verzeichnisses.
-   - Session-Modus: Button enabled wenn _playing_remote_clip == False,
-     disabled (grayed out) wenn externer Clip läuft
-   - Neue Dependency: send2trash (pip install send2trash)
+Ansatz: KEIN flaches Enum (die Dimensionen sind orthogonal). Stattdessen
+drei getrennte, typisierte State-Felder in einem SessionState-Objekt:
 
-✅ Advanced Info Toggle für Activity-Feed & Status-Overhaul
-   Beschreibung: In den Einstellungen eine Option "Erweiterte Infos anzeigen",
-   die in der Activity-Leiste zusätzliche technische Details einblendet
-   (z.B. Dateigröße, Upload/Download-Speed, Codec, Auflösung).
-   Genereller Status-Overhaul: Klarere Rückmeldung was das Programm gerade tut.
-   Umsetzung:
-   - Settings: Checkbox "Erweiterte Infos in Activity-Feed"
-   - Erweiterte Einträge: Dateigröße bei Share, Transfer-Speed, Video-Metadaten
-   - Status-Label Overhaul: Animierter "Lade…"-Indikator statt stiller Phasen
-   - Persistenter Status-Text während Operationen (nicht nur 2-3 Sek.)
-   - Optional: Mini-Fortschrittsbalken in der Statusleiste
+  @dataclass
+  class SessionState:
+      connection: ConnectionState = DISCONNECTED  # DISCONNECTED | CONNECTING | CONNECTED
+      transfer: TransferState = IDLE              # IDLE | UPLOADING | DOWNLOADING | PREFETCHING
+      sync: SyncState = NONE                      # NONE | WAITING_READY | SYNCING | PLAYING
+
+  Regeln (validated per Property-Setter):
+  - transfer=UPLOADING nur wenn connection=CONNECTED
+  - sync=WAITING_READY nur wenn connection=CONNECTED und transfer != UPLOADING
+  - PREFETCHING kann parallel zu PLAYING laufen (das ist der Punkt)
+
+  Ersetzt:
+  - _session_uploading → state.transfer == UPLOADING
+  - _playing_remote_clip → bleibt separat (ist kein State, sondern Clip-Metadata)
+  - _session_shared_pool → bleibt separat (ist ein Setting, kein State)
+  - _session_active → state.connection != DISCONNECTED
+  - _pending_sync_video_id → state.sync == SYNCING + video_id Property
+  - _pending_prepare_video_id → state.sync == WAITING_READY + video_id Property
+
+  _ignore_remote bleibt unverändert — es ist ein synchroner Echo-Guard,
+  kein State. Das zu erfassen wäre over-engineering.
+
+  Implementierung:
+  - SessionState Klasse mit Validierung (~40 LOC)
+  - Property self.session_state auf VideoPlayer
+  - Schrittweise Migration: Alte Flags als Properties die auf session_state delegieren
+    (Backward-compatible, kein Big-Bang-Refactoring)
+  - Debug-Logging bei State-Transitions (nur wenn --debug)
 
 ═══════════════════════════════════════════════
-  IMPROVEMENTS — LOWER PRIORITY
+  4 — RESUMABLE CHUNKED UPLOADS  (🟡)
 ═══════════════════════════════════════════════
 
-🔲 Phase 4 (optional): Migrate threading.Thread to QThread/QRunnable in session_client
-🔲 Split random_clip_player.py (~3200 lines) into modules: config, widgets, session_panel, player
-🔲 Server: session token/JWT so WebSocket auth can't be spoofed with a guessed user_id
-🔲 Server: room count limit to prevent memory exhaustion
-🔲 Optimise folder scan — use targeted globs (*.mp4, *.mkv …) instead of rglob("*")
-🔲 Replace blocking QMessageBox.question in block_current_clip with non-blocking dialog
+Problem: Einzelner multipart POST, bis zu 500MB. Abbruch = Neustart von 0.
+Server liest bereits in 256KB Chunks auf Disk (kein RAM-Problem), aber der
+Client hat keine Resume-Möglichkeit.
+
+  Server-Änderungen:
+  - Neuer Endpoint: POST /rooms/{code}/upload/init
+    Body: {user_id, filename, file_size, chunk_size}
+    Response: {upload_id} (= video_id, generiert hier statt bei Completion)
+    Erstellt temp-Ordner: uploads/{room_code}/chunks/{upload_id}/
+  - Neuer Endpoint: PUT /rooms/{code}/upload/{upload_id}/chunk/{index}
+    Body: Raw Bytes (kein Multipart-Overhead pro Chunk)
+    Server schreibt: chunks/{upload_id}/{index:06d}.part
+    Response: {index, received_bytes}
+  - Neuer Endpoint: GET /rooms/{code}/upload/{upload_id}/status
+    Response: {last_chunk_index, received_bytes, expected_bytes}
+    (Client ruft das bei Resume auf um zu wissen wo er weitermachen soll)
+  - Neuer Endpoint: POST /rooms/{code}/upload/{upload_id}/complete
+    Server merged alle .part Files → finale Datei, räumt temp auf
+    Response: {video_id, filename, size} (identisch zum alten Upload-Response)
+    Broadcasts video_uploaded wie bisher
+  - Alter POST /rooms/{code}/upload bleibt bestehen (Backward-Kompatibilität)
+  - Cleanup: Unvollständige Uploads (>30min alt) bei Room-Cleanup entfernen
+
+  Client-Änderungen (session_client.py):
+  - _upload_thread Rework:
+    1. POST /init → upload_id
+    2. File in CHUNK_SIZE (2MB) Blöcke splitten
+    3. For each chunk: PUT /chunk/{i}, bei Fehler → retry 3x mit 2s Delay
+    4. Progress: Bestehende upload_progress Signal (bytes_sent, total)
+    5. POST /complete → video_id
+    6. send_play_video(video_id) wie bisher
+  - Resume: Bei ConnectionError → GET /status → letzter successful Index →
+    Loop ab Index+1 fortsetzen (kein erneuter /init Call)
+  - Config: chunk_size (default 2MB, nicht user-facing)
+
+  Kein Chunked Download nötig: Server liefert StreamingResponse, Client liest
+  iter_content(256KB). Bei Abbruch reicht ein neuer GET (Server hat die Datei
+  vollständig). Optional: Range-Header Support für partial resume, aber
+  Low-Priority da Downloads schneller sind als Uploads.
 
 ═══════════════════════════════════════════════
-  EMPFOHLENE REIHENFOLGE
+  5 — AUTO-UPDATER  (🟡)
 ═══════════════════════════════════════════════
 
-  ✅ Autoplay-Bug fixen
-  ✅ Slider-Seeking fixen
-  ✅ Multiskip-Bug / Server-Lock
-  ✅ scaletempo2 Audio-Filter
-  ✅ Fullscreen Toggle
+  Startup-Check (Background-Thread, blockiert UI nicht):
+  - GET https://api.github.com/repos/Ukunda/RDM/releases/latest
+    Headers: Accept: application/vnd.github+json
+  - Vergleich: remote tag_name vs. eingebaute VERSION Konstante
+    Parsing: semver-artig (v1.2.3 → Tuple-Vergleich)
+  - Timeout: 5s (Netzwerkfehler → still ignorieren, kein Popup)
+  - Rate: Einmal pro Programmstart, kein wiederholter Timer
 
-  1. 🔲 Startup-Dialog                  (🟢 schnell umsetzbar, guter UX-Gewinn)
-  2. 🔲 Advanced Info & Status-Overhaul  (🟢 reduziert User-Verwirrung)
-  3. 🔲 UX-Sofortmaßnahmen Downloads    (🟢 Fortschrittsbalken-Overlay)
-  4. 🔲 Pool Opt-In/Out pro User        (🟡 mittlerer Aufwand)
-  5. 🔲 Dislike Dual-Funktion           (🟡 mittlerer Aufwand)
-  6. 🔲 Auto-Updater                    (🟡 eigenständiges Feature)
-  7. 🐛 Shared Pool Rework              (🟡 nach Pool Opt-In, baut darauf auf)
-  8. 🐛 Desync-Erkennung / Heartbeat    (🟡 nach State Machine)
-  9. 🔲 Phase 3: State Machine          (🔴 Kernrefactoring, enabler für vieles)
-  10. 🔲 Video-Queue + Prefetch          (🔴 großes Feature, nach State Machine)
-  11. 🔲 Transfer-Optimierung Stufe 2+3  (🔴 nach Queue-System)
+  Update-Dialog (nur wenn neue Version vorhanden):
+  - "Update verfügbar: v1.2 → v1.3"
+  - Release-Notes (body aus GitHub API) anzeigen (QTextBrowser, Markdown)
+  - Drei Buttons:
+    "Jetzt updaten" → startet Download + Update-Prozess
+    "Später" → schließt Dialog, fragt beim nächsten Start erneut
+    "Überspringen" → skipped_version=tag in config, nie wieder für diese Version
+  - Prüfung: if tag == config.skipped_version → kein Dialog
+
+  Update-Mechanismus (Windows-spezifisch):
+  - Download: .exe aus release assets[0].browser_download_url → %TEMP%\rdm_update.exe
+  - Progress-Dialog (QProgressDialog) mit Download-Fortschritt
+  - Nach Download: Schreibe updater.bat nach %TEMP%:
+      @echo off
+      timeout /t 2 /nobreak > nul
+      move /y "%TEMP%\rdm_update.exe" "{aktueller_exe_pfad}"
+      start "" "{aktueller_exe_pfad}"
+      del "%~f0"
+  - Starte updater.bat (detached, CREATE_NO_WINDOW)
+  - App beendet sich (sys.exit)
+  - Batch-Script: wartet 2s (Prozess-Exit), überschreibt, startet neu, löscht sich
+
+  Sicherheit:
+  - HTTPS-only für Download
+  - Optionale Checksum-Verifikation (SHA256 in Release-Notes oder als .sha256 Asset)
+
+═══════════════════════════════════════════════
+  6 — PREFETCH NÄCHSTES VIDEO  (🟡→🔴)
+═══════════════════════════════════════════════
+
+Problem: Jeder Clip-Wechsel in Sessions hat 5-30s Wartezeit
+(Upload + Download + Ready-Sync). Bei großen Dateien unerträglich.
+
+Ansatz: Spekulativer Prefetch des NÄCHSTEN Clips während der aktuelle läuft.
+Kein Queue-UI, kein Server-Queue-State, kein Drag-to-Reorder.
+
+  Neues Konzept: "Prefetch-Slot"
+  - Client hat einen Prefetch-Slot: {video_id, local_path} oder None
+  - Server hat pro Room: prefetch_video = {video_id, ready_users: set} oder None
+
+  Flow — Prefetch einleiten (nach all_ready des aktuellen Clips):
+  1. Host wartet 3s (lässt User erst den Clip sehen)
+  2. Host sendet: {"type": "request_prefetch"} (wie request_random, aber non-blocking)
+  3. Server wählt Provider (gleiche Logik wie request_random, mit Timeout/Retry aus Fix #2)
+  4. Provider erhält: {"type": "provide_prefetch_clip"} → wählt nächsten Clip,
+     uploaded via bestehenden Upload-Endpoint
+  5. Provider sendet: {"type": "prefetch_ready", "video_id": id}
+  6. Server setzt room.prefetch_video = {video_id, ready_users: {provider_uid}}
+  7. Server broadcasts: {"type": "prefetch_available", "video_id": id, "filename": name}
+  8. Andere Clients downloaden im Hintergrund (state.transfer = PREFETCHING)
+  9. Nach Download: Client sendet {"type": "prefetch_downloaded", "video_id": id}
+  10. Server trackt ready_users. Wenn alle ready → room.prefetch_video.all_ready = True
+
+  Flow — Prefetch nutzen (wenn User nächsten Clip will):
+  1. Host ruft play_random_clip → prüft prefetch_slot
+  2. Wenn prefetch_slot vorhanden UND video_id == room.prefetch_video:
+     - Host sendet {"type": "play_prefetched", "video_id": id}
+     - Server: Wenn alle prefetch_downloaded → sofort all_ready (skip Download-Phase)
+     - Server: Wenn nicht alle ready → normaler ready-sync (die die noch downloaden
+       müssen warten, aber die meisten haben es schon)
+  3. Wenn kein Prefetch oder Prefetch nicht ready → normaler Flow (upload + ready-sync)
+
+  Client State:
+  - _prefetch_slot: Optional[dict] = None  # {"video_id": str, "local_path": str}
+  - transfer State: PREFETCHING (parallel zu PLAYING erlaubt, siehe State Consolidation)
+  - SessionPanel: Kleiner Indikator "⏳ Nächster Clip wird vorbereitet…" (kein Overlay)
+
+  Edge Cases:
+  - User skipped bevor Prefetch fertig → Prefetch verwerfen, normaler Flow
+  - Provider disconnected während Prefetch → Prefetch abbrechen, kein Fehler (war optional)
+  - Prefetch-Clip == aktueller Clip (Provider hat nur wenige) → ignorieren
+
+  Abhängigkeit: Pool Robustheit (#2) muss fertig sein (Timeout/Retry-Logik)
+  Profitiert von: State Consolidation (#3, PREFETCHING Dimension)
+
+═══════════════════════════════════════════════
+  7 — MODUL-SPLIT  (🟡 Housekeeping)
+═══════════════════════════════════════════════
+
+random_clip_player.py ist bei 3500+ Zeilen. Wartbarkeit leidet.
+
+  Vorgeschlagene Aufteilung:
+  - config.py: ConfigManager Klasse + COLORS dict + Defaults (~200 LOC)
+  - widgets.py: StyledButton, ClickableSlider, ButtonBar, BlockedListDialog,
+    SettingsDialog, StartupDialog, TransferOverlay (~800 LOC)
+  - session_panel.py: SessionPanel Klasse (~500 LOC)
+  - player.py: VideoPlayer Klasse (Rest, ~2000 LOC)
+  - main.py: Entry-Point (__main__), Argument-Parsing, Logging-Setup (~50 LOC)
+
+  Migration-Strategie (kein Big-Bang):
+  1. config.py extrahieren (keine Abhängigkeit auf andere Module)
+  2. widgets.py extrahieren (hängt nur von config.py ab)
+  3. session_panel.py extrahieren (hängt von config, widgets, session_client ab)
+  4. player.py ist der Rest
+  5. Circular Imports vermeiden: SessionPanel bekommt VideoPlayer-Referenz per
+     __init__(player=...) statt Import
+
+  Timing: NACH Abschluss aller Feature-Arbeit. Merge-Konflikte während
+  paralleler Feature-Entwicklung sind es nicht wert.
+
+═══════════════════════════════════════════════
+  HOUSEKEEPING — KLEIN
+═══════════════════════════════════════════════
+
+🔲 Server: Room-Count-Limit (max 50 Rooms)
+   Einzeiler in create_room. if len(rooms) >= MAX_ROOMS: return 503.
+
+🔲 Server: Auth-Token statt user_id
+   Bei Join: Server generiert JWT/HMAC-Token, Client sendet Token bei WS-Auth.
+   Verhindert user_id-Spoofing. Niedrige Priorität (Server läuft lokal/Docker).
+
+🔲 Folder-Scan: rglob("*") → gezielte Extension-Globs (*.mp4, *.mkv, etc.)
+   Nur messbar bei Verzeichnissen mit vielen Nicht-Video-Dateien.
+
+🔲 _playing_remote_clip Fix (Teil von #2d, aber auch standalone machbar)
+   _on_all_ready: check ob video_id eigener Upload war → False statt True.
+
+═══════════════════════════════════════════════
+  REIHENFOLGE
+═══════════════════════════════════════════════
+
+  1. 🐛 Desync-Heartbeat              (🟢 ~60 LOC, höchster UX-Impact/LOC)
+  2. 🐛 Shared Pool Robustheit        (🟡 Timeout, Clip-Count, Exhaustion-Tracking)
+  3. 🔲 Session State Consolidation    (🟡 Basis für Prefetch, reduziert Flag-Chaos)
+  4. 🔲 Auto-Updater                   (🟡 eigenständig, kein Risiko)
+  5. 🔲 Resumable Uploads              (🟡 Chunked + Resume)
+  6. 🔲 Prefetch nächstes Video        (🔴 nach #2 + #3, größtes UX-Feature)
+  7. 🔲 Modul-Split                    (🟡 nach Feature-Freeze)
