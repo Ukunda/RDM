@@ -63,7 +63,7 @@ Legende:
    server and stall the ready-sync. User denken das Programm ist abgestürzt,
    weil keine sichtbare Aktivität stattfindet.
    Umsetzung (gestuft):
-   Stufe 1 — UX-Sofortmaßnahmen (🟢 einfach):
+   Stufe 1 — UX-Sofortmaßnahmen (🟢 einfach): ✅ DONE
    - Prominenter Fortschrittsbalken im Video-Bereich (Overlay) statt nur im
      Session-Panel. Zeigt: "Lade Video… 234 MB / 512 MB (45%) — 2.1 MB/s"
    - Geschätzte Restzeit (ETA) anzeigen
@@ -90,7 +90,7 @@ Legende:
    - Central state handler that rejects impossible transitions
    - This will fix most of the session race condition bugs above
 
-🔲🟡 Individueller Pool-Opt-In/Out pro User
+✅ Individueller Pool-Opt-In/Out pro User
    Beschreibung: Jeder User in der Session soll per Toggle entscheiden können,
    ob die eigenen Clips im Shared Random Pool verfügbar sind oder nicht.
    Der Toggle muss jederzeit während der Session umschaltbar sein.
@@ -119,7 +119,7 @@ Legende:
    - Ready-Sync anpassen: Prefetch-Videos überspringen Ready-Download-Phase
    Abhängigkeit: Profitiert von Phase 3 State Machine für saubere Transitions.
 
-🔲🟢 Startup-Dialog: "Zuschauen" vs. "Clips teilen"
+✅ Startup-Dialog: "Zuschauen" vs. "Clips teilen"
    Beschreibung: Beim Programmstart erscheint ein moderner Dialog mit zwei
    Optionen: (A) "Ich möchte nur zuschauen" → Überspringt Ordnerauswahl,
    öffnet direkt den Session-Beitritts-Dialog. (B) "Ich habe eigene Clips" →
@@ -145,7 +145,7 @@ Legende:
    - "Nah I'm good" → don't ask again for this version
    - Store skipped version + "later" state in config.json
 
-🔲 Dislike-Button: Reaktivierung im Session-Modus + Dual-Funktion
+✅ Dislike-Button: Reaktivierung im Session-Modus + Dual-Funktion
    Beschreibung: Der Dislike-Button (👎) soll im Session-Modus wieder aktiv
    sein, aber ausgegraut wenn gerade ein externer Clip läuft (da man fremde
    Clips nicht löschen/blocken kann). Zusätzlich bekommt der Button zwei Modi:
@@ -164,7 +164,7 @@ Legende:
      disabled (grayed out) wenn externer Clip läuft
    - Neue Dependency: send2trash (pip install send2trash)
 
-🔲🟢 Advanced Info Toggle für Activity-Feed & Status-Overhaul
+✅ Advanced Info Toggle für Activity-Feed & Status-Overhaul
    Beschreibung: In den Einstellungen eine Option "Erweiterte Infos anzeigen",
    die in der Activity-Leiste zusätzliche technische Details einblendet
    (z.B. Dateigröße, Upload/Download-Speed, Codec, Auflösung).
