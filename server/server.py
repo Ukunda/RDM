@@ -82,6 +82,7 @@ class Room:
     current_video: Optional[str] = None                # video_id of active clip
     videos: dict = field(default_factory=dict)          # video_id -> file metadata
     shared_pool: bool = False                           # Shared random pool mode
+    pool_opted_in: dict = field(default_factory=dict)   # user_id -> bool (per-user pool opt-in)
     pending_video: Optional[str] = None                  # video_id waiting for all users to be ready
     ready_users: set = field(default_factory=set)         # user_ids that reported ready for pending_video
     playback_state: dict = field(default_factory=lambda: {
@@ -523,6 +524,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
         # Register user in room
         user = User(user_id=user_id, username=username, websocket=websocket)
         room.users[user_id] = user
+        room.pool_opted_in.setdefault(user_id, True)  # Default to opted-in
         room.touch()
 
         # Send current room state
@@ -706,11 +708,28 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                 })
                 log.info(f"Shared pool {'enabled' if room.shared_pool else 'disabled'} in room {room_code}")
 
+            elif msg_type == "pool_opt_in":
+                opted_in = data.get("opted_in", True)
+                room.pool_opted_in[user_id] = opted_in
+                await broadcast(room, {
+                    "type": "pool_opt_in_changed",
+                    "user_id": user_id,
+                    "username": username,
+                    "opted_in": opted_in,
+                })
+                log.info(f"Pool opt-in for '{username}' in room {room_code}: {opted_in}")
+
             elif msg_type == "request_random":
                 # In shared pool mode, pick a random user to provide a clip
                 if room.shared_pool and len(room.users) > 0:
-                    # Pick a random user from the room
-                    target_uid = random.choice(list(room.users.keys()))
+                    # Filter to users who opted in to the pool
+                    eligible = [uid for uid in room.users if room.pool_opted_in.get(uid, True)]
+                    if eligible:
+                        target_uid = random.choice(eligible)
+                    else:
+                        # No one opted in — fall back to requester
+                        target_uid = user_id
+                    target = room.users.get(target_uid)
                     target = room.users.get(target_uid)
                     if target:
                         try:

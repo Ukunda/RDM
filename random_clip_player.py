@@ -1420,6 +1420,14 @@ class SessionPanel(QFrame):
         self.shared_pool_cb.toggled.connect(self._on_shared_pool_toggled)
         sess_layout.addWidget(self.shared_pool_cb)
 
+        # Per-user pool opt-in
+        self.pool_opt_in_cb = QCheckBox("🎲 Meine Clips im Pool")
+        self.pool_opt_in_cb.setToolTip("When on, your clips are available for the shared random pool")
+        self.pool_opt_in_cb.setChecked(True)
+        self.pool_opt_in_cb.setStyleSheet(self.shared_pool_cb.styleSheet())
+        self.pool_opt_in_cb.toggled.connect(self._on_pool_opt_in_toggled)
+        sess_layout.addWidget(self.pool_opt_in_cb)
+
         sess_layout.addWidget(self._make_separator())
 
         # Users list
@@ -1778,6 +1786,7 @@ class SessionPanel(QFrame):
         if self._player:
             c.random_clip_requested.connect(self._player._on_random_clip_requested)
         c.shared_pool_changed.connect(self._on_shared_pool_changed)
+        c.pool_opt_in_changed.connect(self._on_pool_opt_in_changed)
 
         # Transition lock — server rejected our play_video because one is pending
         c.transition_busy.connect(self._on_transition_busy)
@@ -2129,6 +2138,16 @@ class SessionPanel(QFrame):
         if self._player:
             self._player._session_shared_pool = enabled
         self.add_activity(f"🎲 {changed_by} {'enabled' if enabled else 'disabled'} shared pool")
+
+    def _on_pool_opt_in_toggled(self, checked):
+        """User toggled their own pool opt-in."""
+        if self.session_client and self.session_client.is_connected:
+            self.session_client.send_pool_opt_in(checked)
+
+    def _on_pool_opt_in_changed(self, username, opted_in):
+        """Another user changed their pool opt-in status."""
+        icon = "🎲" if opted_in else "—"
+        self.add_activity(f"{icon} {username} {'joined' if opted_in else 'left'} the clip pool")
 
     def cleanup(self):
         if self.session_client:

@@ -71,6 +71,7 @@ class SessionSignals(QObject):
     # Shared pool — server asks you to provide a random clip
     random_clip_requested = Signal()              # Server wants us to share a random clip
     shared_pool_changed = Signal(bool, str)       # (enabled, changed_by)
+    pool_opt_in_changed = Signal(str, bool)       # (username, opted_in)
 
     # Transition lock — server rejected play_video because one is already pending
     transition_busy = Signal(str)                 # (message)
@@ -265,6 +266,10 @@ class SessionClient:
     def send_set_shared_pool(self, enabled: bool):
         """Host toggles shared random pool mode."""
         self._send({"type": "set_shared_pool", "enabled": enabled})
+
+    def send_pool_opt_in(self, opted_in: bool):
+        """Tell the server whether our clips are available in the shared pool."""
+        self._send({"type": "pool_opt_in", "opted_in": opted_in})
 
     def send_ping(self):
         """Send a ping to measure round-trip latency."""
@@ -610,6 +615,12 @@ class SessionClient:
                 self.signals.shared_pool_changed.emit(
                     data.get("enabled", False),
                     data.get("changed_by", ""),
+                )
+
+            elif msg_type == "pool_opt_in_changed":
+                self.signals.pool_opt_in_changed.emit(
+                    data.get("username", ""),
+                    data.get("opted_in", True),
                 )
 
             elif msg_type == "error":
