@@ -547,8 +547,16 @@ class ClickableSlider(QSlider):
         if event.button() == Qt.MouseButton.LeftButton:
             val = self.minimum() + ((self.maximum() - self.minimum()) * event.position().x()) / self.width()
             self.setValue(int(val))
-            self.sliderMoved.emit(int(val))
+            # Emit sliderPressed so the player knows we're dragging
+            self.sliderPressed.emit()
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            val = self.minimum() + ((self.maximum() - self.minimum()) * event.position().x()) / self.width()
+            self.setValue(int(val))
+            self.sliderReleased.emit()
+        super().mouseReleaseEvent(event)
 
 
 class DraggableWidget(QWidget):
@@ -2045,7 +2053,7 @@ class VideoPlayer(QMainWindow):
         
         self.time_slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.time_slider.setRange(0, 1000)
-        self.time_slider.sliderMoved.connect(self._set_position)
+        self.time_slider.sliderMoved.connect(self._on_slider_moved)
         self.time_slider.sliderPressed.connect(self._slider_pressed)
         self.time_slider.sliderReleased.connect(self._slider_released)
         
@@ -2744,8 +2752,14 @@ class VideoPlayer(QMainWindow):
         self.status_label.setText(f"⏮ -1 frame ({fps:.0f}fps)")
         QTimer.singleShot(1000, self._update_status_bar)
 
+    def _on_slider_moved(self, position):
+        """Update time label while dragging, but don't seek yet"""
+        if self._cached_duration > 0:
+            pos_sec = (position / 1000.0) * self._cached_duration
+            self.time_label.setText(self._format_time(int(pos_sec * 1000)))
+
     def _set_position(self, position):
-        """Set video position from slider"""
+        """Set video position from slider (called on release only)"""
         if not self.player:
             return
         if self._cached_duration > 0:
@@ -2754,11 +2768,11 @@ class VideoPlayer(QMainWindow):
             self._session_send_seek(pos_sec)
 
     def _slider_pressed(self):
-        """Handle slider press"""
+        """Handle slider press — suppress time-pos observer updates"""
         self.is_slider_pressed = True
 
     def _slider_released(self):
-        """Handle slider release"""
+        """Handle slider release — perform the actual seek"""
         self.is_slider_pressed = False
         self._set_position(self.time_slider.value())
 
