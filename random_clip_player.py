@@ -6,6 +6,7 @@ Version 4.5 - Bugfix & Stability
 
 import sys
 import os
+import locale
 import json
 import random
 import ctypes
@@ -16,6 +17,9 @@ import threading
 import argparse
 import logging
 import traceback
+
+# libmpv requires LC_NUMERIC to be "C" — set this before importing mpv
+locale.setlocale(locale.LC_NUMERIC, "C")
 from enum import Enum
 from pathlib import Path
 from PySide6.QtWidgets import (
@@ -4799,6 +4803,8 @@ def main():
 
     # Note: High DPI scaling is always enabled in Qt6/PySide6
     app = QApplication(sys.argv)
+    # Qt resets LC_NUMERIC on startup; libmpv requires it to be "C" to avoid a segfault
+    locale.setlocale(locale.LC_NUMERIC, "C")
     app.setApplicationName("Random Clip Player")
     app.setStyle('Fusion')
     
