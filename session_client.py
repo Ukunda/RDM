@@ -138,6 +138,9 @@ class SessionClient:
         # Track available videos
         self._videos: dict = {}  # video_id -> metadata
 
+        # Track in-progress downloads to prevent duplicates
+        self._downloading: set = set()
+
         # Ping measurement
         self._ping_sent_at: float = 0.0
         self._ping_timer: Optional[threading.Timer] = None
@@ -197,6 +200,7 @@ class SessionClient:
         self._shutting_down = False
         self._reconnect_attempts = 0
         self._last_password = password
+        self._download_dir = Path(tempfile.mkdtemp(prefix="rdm_session_"))
         threading.Thread(
             target=self._create_room_thread,
             args=(server_url, username, password),
@@ -208,6 +212,7 @@ class SessionClient:
         self._shutting_down = False
         self._reconnect_attempts = 0
         self._last_password = password
+        self._download_dir = Path(tempfile.mkdtemp(prefix="rdm_session_"))
         threading.Thread(
             target=self._join_room_thread,
             args=(server_url, username, room_code, password),
@@ -233,6 +238,7 @@ class SessionClient:
         self._username = None
         self._host_id = None
         self._videos.clear()
+        self._downloading.clear()
         self.cleanup()
 
     def cleanup(self):
@@ -348,6 +354,8 @@ class SessionClient:
                 json={"password": self._last_password or "", "username": self._username},
                 timeout=10,
             )
+            if self._shutting_down:  # Re-check after blocking call
+                return
             if resp.status_code == 200:
                 data = resp.json()
                 self._user_id = data["user_id"]
@@ -568,7 +576,8 @@ class SessionClient:
                 )
 
             elif msg_type == "kicked":
-                # We were kicked from the room
+                # We were kicked from the room — prevent auto-reconnect
+                self._shutting_down = True
                 self._connected = False
                 self.signals.kicked.emit(data.get("message", "Kicked from room"))
 
@@ -774,7 +783,10 @@ class SessionClient:
                             )
                             if chunk_resp.status_code == 200:
                                 break
-                            error = chunk_resp.json().get("detail", chunk_resp.text)
+                            try:
+                                error = chunk_resp.json().get("detail", chunk_resp.text)
+                            except (ValueError, KeyError):
+                                error = chunk_resp.text
                             log.warning(f"Chunk {chunk_idx} failed (attempt {attempt+1}): {error}")
                             if attempt < 2:
                                 time.sleep(2 ** attempt)
@@ -847,6 +859,10 @@ class SessionClient:
 
     def _download_thread(self, video_id: str):
         """Download a video from the server to a local temp file."""
+        # Prevent concurrent downloads of the same video
+        if video_id in self._downloading:
+            return
+        self._downloading.add(video_id)
         try:
             # Check if already downloaded
             existing = self.get_local_video_path(video_id)
@@ -859,7 +875,9 @@ class SessionClient:
             total_size = meta.get("size", 0)
 
             url = f"{self._server_url}/rooms/{self._room_code}/videos/{video_id}"
-            local_path = str(self._download_dir / f"{video_id}_{filename}")
+            safe_vid = video_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+            safe_name = os.path.basename(filename).replace("..", "_")
+            local_path = str(self._download_dir / f"{safe_vid}_{safe_name}")
 
             resp = requests.get(url, stream=True, timeout=600)
             if resp.status_code not in (200, 206):
@@ -884,4 +902,6 @@ class SessionClient:
         except Exception as e:
             log.error(f"Download error: {e}")
             self.signals.room_error.emit(f"Download error: {e}")
+        finally:
+            self._downloading.discard(video_id)
 

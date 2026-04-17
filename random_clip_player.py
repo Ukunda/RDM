@@ -2022,6 +2022,8 @@ class SessionPanel(QFrame):
         # Clear phase on error so user can try again
         if self._player:
             self._player._set_session_phase(SessionPhase.IDLE)
+            self._player._operation_status = ""
+            self._player._prefetch_video_id = None
 
     def _on_transition_busy(self, msg):
         """Server rejected our play_video — another transition is in progress."""
@@ -2046,6 +2048,7 @@ class SessionPanel(QFrame):
             self._player._update_session_dot(False)
             self._player._session_shared_pool = False
             self._player._set_session_phase(SessionPhase.IDLE)
+            self._player._operation_status = ""
             self._player._heartbeat_timer.stop()
             self._player._prefetch_video_id = None
             self._player._prefetch_timer.stop()
@@ -2135,14 +2138,15 @@ class SessionPanel(QFrame):
             return
 
         # Host uploaded this clip — load, pause, wait for all_ready
-        if self.session_client and self.session_client.is_connected:
+        if self.session_client and self.session_client.is_connected and phase == SessionPhase.UPLOADING:
             if self._player:
+                self._player._phase_video_id = video_id  # Now known after upload
                 self._player._load_session_video(local_path)
                 QTimer.singleShot(200, lambda: self._host_wait_for_ready(video_id))
             QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
             return
 
-        # Fallback: not in a session, just play
+        # Fallback: connected or not — just play
         if self._player:
             self._player._play_session_video(video_id, local_path)
         QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
@@ -2154,6 +2158,8 @@ class SessionPanel(QFrame):
             self._player.player.pause = True
             self._player.play_btn.setText("▶  Play")
             self._player._ignore_remote = False
+        if self._player:
+            self._player._set_session_phase(SessionPhase.READY_WAIT, video_id)
         self.progress_label.setText("⏳ Waiting for everyone to download...")
 
     def _pause_and_report_ready(self, video_id):
@@ -2177,6 +2183,9 @@ class SessionPanel(QFrame):
 
     def _on_all_ready(self, video_id, uploaded_by=""):
         """Everyone is ready — start playback from the beginning."""
+        # Validate this all_ready is for our current phase (ignore stale signals)
+        if self._player and self._player._phase_video_id is not None and self._player._phase_video_id != video_id:
+            return
         self.add_activity("✅ All synced — playing!")
         self.progress_label.setText("▶ Playing!")
         QTimer.singleShot(2000, lambda: self.progress_label.setText(""))
@@ -2192,7 +2201,9 @@ class SessionPanel(QFrame):
             self._player.play_btn.setText("⏸  Pause")
             self._player._apply_current_speed()
             self._player._ignore_remote = False
-            self._player._heartbeat_timer.start()
+            # Only start heartbeat for host (non-host _send_position_heartbeat returns early)
+            if self._player.is_host_in_session():
+                self._player._heartbeat_timer.start()
             # Start prefetch timer (host only, shared pool, >1 user)
             if self._player.is_host_in_session() and self._player._session_shared_pool:
                 self._player._prefetch_timer.start()
@@ -2253,7 +2264,7 @@ class SessionPanel(QFrame):
 
     def cleanup(self):
         if self.session_client:
-            self.session_client.cleanup()
+            self.session_client.disconnect()
 
 
 # ============================================================================
@@ -3247,6 +3258,7 @@ class VideoPlayer(QMainWindow):
                 vid = self._prefetch_video_id
                 self._prefetch_video_id = None
                 self._prefetch_timer.stop()
+                self._set_session_phase(SessionPhase.DOWNLOADING, vid)
                 client.send_play_video(vid)
                 self.status_label.setText("⚡ Playing prefetched clip...")
                 return
@@ -3615,6 +3627,7 @@ class VideoPlayer(QMainWindow):
         duration = self.player.duration or 0.0
         new_time = max(0, min(duration, current + (ms / 1000.0)))
         self.player.seek(new_time, reference='absolute')
+        self._session_send_seek(new_time)
 
     def _cache_fps(self):
         """Cache the FPS of current video"""
@@ -3964,6 +3977,12 @@ class VideoPlayer(QMainWindow):
 
     def _on_random_clip_requested(self):
         """Server picked us to provide a random clip for the shared pool."""
+        if self._session_phase != SessionPhase.IDLE:
+            # Already busy — tell server we can't provide a clip right now
+            client = self._get_session_client()
+            if client:
+                client.send_pool_exhausted()
+            return
         if not self.play_queue:
             self._refresh_queue()
         if not self.play_queue:

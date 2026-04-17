@@ -125,6 +125,7 @@ class ServerState:
     def __init__(self):
         self.rooms: dict[str, Room] = {}
         self.join_attempts: dict[str, list[float]] = {}  # ip -> [timestamps]
+        self.authenticated_users: dict[str, str] = {}    # user_id -> room_code (one-time WS auth tokens)
 
     def generate_room_code(self) -> str:
         """Generate a unique room code like 'ABCDE-12345-FGHIJ'."""
@@ -238,6 +239,10 @@ async def lifespan(app: FastAPI):
     log.info(f"Server started on {SERVER_HOST}:{SERVER_PORT}")
     yield
     task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     log.info("Server shutting down")
 
 
@@ -278,6 +283,7 @@ async def create_room(request: Request):
 
     user_id = secrets.token_hex(8)
     room = state.create_room(password, host_id=user_id)
+    state.authenticated_users[user_id] = room.room_code
 
     return {
         "room_code": room.room_code,
@@ -309,6 +315,7 @@ async def join_room(room_code: str, request: Request):
 
     user_id = secrets.token_hex(8)
     room = state.rooms[room_code]
+    state.authenticated_users[user_id] = room.room_code
     room.touch()
 
     return {
@@ -373,6 +380,10 @@ async def upload_video(
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(500, "Upload failed")
+
+    if total_size == 0:
+        filepath.unlink(missing_ok=True)
+        raise HTTPException(400, "Empty file")
 
     # Store metadata
     room.videos[video_id] = {
@@ -466,10 +477,13 @@ async def upload_chunk(room_code: str, upload_id: str, index: int, request: Requ
     if not body:
         raise HTTPException(400, "Empty chunk")
 
-    if upload["received_bytes"] + len(body) > MAX_FILE_SIZE:
-        raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)")
-
     chunk_path = Path(upload["chunks_dir"]) / f"{index:06d}.part"
+
+    if index not in upload["received_chunks"]:
+        # Only check size limit for new chunks (not retransmissions)
+        if upload["received_bytes"] + len(body) > MAX_FILE_SIZE:
+            raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)")
+
     async with aiofiles.open(chunk_path, "wb") as f:
         await f.write(body)
 
@@ -538,11 +552,11 @@ async def complete_chunked_upload(room_code: str, upload_id: str):
                         await out.write(data)
     except Exception as e:
         filepath.unlink(missing_ok=True)
-        raise HTTPException(500, f"Failed to merge chunks: {e}")
+        log.error(f"Failed to merge chunks for upload {upload_id}: {e}")
+        raise HTTPException(500, "Failed to merge chunks")
     finally:
         await asyncio.to_thread(shutil.rmtree, str(chunks_dir), True)
-
-    del room.pending_uploads[upload_id]
+        room.pending_uploads.pop(upload_id, None)
 
     room.videos[video_id] = {
         "filename": upload["filename"],
@@ -596,12 +610,18 @@ async def stream_video(room_code: str, video_id: str, request: Request):
     content_type = content_types.get(ext, "application/octet-stream")
 
     if range_header:
-        # Parse range request
+        # Parse range request (supports standard and suffix-byte-range per RFC 7233)
         try:
             range_val = range_header.strip().replace("bytes=", "")
-            range_parts = range_val.split("-")
-            start = int(range_parts[0]) if range_parts[0] else 0
-            end = int(range_parts[1]) if len(range_parts) > 1 and range_parts[1] else file_size - 1
+            if range_val.startswith("-"):
+                # Suffix-byte-range: last N bytes
+                suffix_length = int(range_val[1:])
+                start = max(0, file_size - suffix_length)
+                end = file_size - 1
+            else:
+                range_parts = range_val.split("-")
+                start = int(range_parts[0]) if range_parts[0] else 0
+                end = int(range_parts[1]) if len(range_parts) > 1 and range_parts[1] else file_size - 1
         except (ValueError, IndexError):
             raise HTTPException(416, "Invalid range header")
         if start < 0 or start >= file_size or end < start:
@@ -659,7 +679,7 @@ async def broadcast(room: Room, message: dict, exclude_id: Optional[str] = None)
     """Send a message to all users in a room, optionally excluding one."""
     data = json.dumps(message)
     disconnected = []
-    for uid, user in room.users.items():
+    for uid, user in list(room.users.items()):
         if uid == exclude_id:
             continue
         try:
@@ -802,6 +822,13 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
             await websocket.send_json({"type": "error", "message": "Invalid user_id"})
             await websocket.close()
             return
+
+        # Validate user_id was issued by create_room or join_room
+        if state.authenticated_users.get(user_id) != room_code:
+            await websocket.send_json({"type": "error", "message": "Invalid credentials"})
+            await websocket.close()
+            return
+        del state.authenticated_users[user_id]  # One-time use
 
         # Register user in room
         user = User(user_id=user_id, username=username, websocket=websocket)
@@ -1159,6 +1186,22 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                 "username": username,
                 "users": room.user_list(),
             })
+
+            # Re-check ready-sync: if remaining users are all ready, trigger all_ready
+            if room.pending_video and room.users:
+                vid = room.pending_video
+                ready_count = len(room.ready_users & set(room.users.keys()))
+                if ready_count >= len(room.users):
+                    room.pending_video = None
+                    room.playback_state["playing"] = True
+                    room.playback_state["position"] = 0.0
+                    room.playback_state["timestamp"] = time.time()
+                    uploaded_by = room.videos.get(vid, {}).get("uploaded_by", "")
+                    await broadcast(room, {
+                        "type": "all_ready",
+                        "video_id": vid,
+                        "uploaded_by": uploaded_by,
+                    })
 
             # If room is empty, schedule cleanup
             if not room.users:
