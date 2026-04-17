@@ -853,8 +853,9 @@ class TransferOverlay(QFrame):
         layout.addWidget(self._container)
 
     def _resize_to_parent(self):
-        if self.parentWidget():
-            self.setGeometry(self.parentWidget().rect())
+        parent = self.parentWidget()
+        if parent:
+            self.setGeometry(parent.rect())
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -3766,11 +3767,11 @@ class VideoPlayer(QMainWindow):
             parts.append(size)
             # Resolution from MPV
             vp = self.player.video_params
-            if vp and 'w' in vp and 'h' in vp:
+            if isinstance(vp, dict) and 'w' in vp and 'h' in vp:
                 parts.append(f"{vp['w']}×{vp['h']}")
             # Video codec
             vcodec = self.player.video_codec
-            if vcodec:
+            if isinstance(vcodec, str) and vcodec:
                 # Simplify codec string (e.g. "h264 (High)" → "h264")
                 parts.append(vcodec.split()[0] if ' ' in vcodec else vcodec)
             if parts:
@@ -4237,7 +4238,7 @@ class VideoPlayer(QMainWindow):
     def _load_session_video(self, local_path):
         """Load a session video into the player but don't start playback.
         Used for ready-sync: load the video, pause, then wait for all_ready."""
-        if os.path.exists(local_path):
+        if os.path.exists(local_path) and self.player:
             self._ignore_remote = True
             self._playing_remote_clip = True
             self.current_video = local_path

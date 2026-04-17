@@ -513,6 +513,8 @@ class SessionClient:
 
     def _connect_ws(self):
         """Connect the WebSocket to the room."""
+        if not self._server_url or not self._room_code:
+            return
         ws_url = f"{self._ws_url(self._server_url)}/ws/{self._room_code}"
 
         self._ws = websocket.WebSocketApp(
