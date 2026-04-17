@@ -25,6 +25,8 @@ import websocket  # websocket-client library
 log = logging.getLogger("rdm-session")
 
 CHUNK_SIZE = 5 * 1024 * 1024  # 5MB — sweet spot for resumable uploads
+DOWNLOAD_SEGMENTS = 3         # Number of parallel download segments
+PARALLEL_DOWNLOAD_THRESHOLD = 10 * 1024 * 1024  # 10MB — below this, single-stream is fine
 
 # ============================================================================
 # Session Client Signals (thread-safe communication with UI)
@@ -89,6 +91,9 @@ class SessionSignals(QObject):
 
     # Heartbeat — host position sync for drift correction
     position_heartbeat = Signal(float, float)   # (position, speed)
+
+    # Video queue
+    queue_updated = Signal(list)                # (queue_items) — full queue state
 
 
 # ============================================================================
@@ -311,6 +316,22 @@ class SessionClient:
         """Send current playback position for drift correction (host only)."""
         self._send({"type": "position_heartbeat", "position": position, "speed": speed})
 
+    def send_queue_add(self, video_id: str):
+        """Add a video to the room queue."""
+        self._send({"type": "queue_add", "video_id": video_id})
+
+    def send_queue_remove(self, video_id: str):
+        """Remove a video from the room queue."""
+        self._send({"type": "queue_remove", "video_id": video_id})
+
+    def send_queue_reorder(self, video_id: str, new_index: int):
+        """Move a queue item to a new position."""
+        self._send({"type": "queue_reorder", "video_id": video_id, "new_index": new_index})
+
+    def send_queue_play_next(self):
+        """Play the next item from the queue (triggers ready-sync)."""
+        self._send({"type": "queue_play_next"})
+
     def start_ping_loop(self, interval: float = 5.0):
         """Start a repeating ping every `interval` seconds."""
         self.stop_ping_loop()
@@ -398,6 +419,14 @@ class SessionClient:
         threading.Thread(
             target=self._upload_thread,
             args=(filepath, True),
+            daemon=True,
+        ).start()
+
+    def upload_video(self, filepath: str):
+        """Upload a video without triggering play — for queue additions."""
+        threading.Thread(
+            target=self._upload_thread,
+            args=(filepath, False, True),
             daemon=True,
         ).start()
 
@@ -552,6 +581,10 @@ class SessionClient:
 
             if msg_type == "room_state":
                 self.signals.room_joined.emit(data)
+                # Emit queue state on join
+                queue = data.get("queue", [])
+                if queue:
+                    self.signals.queue_updated.emit(queue)
                 # Sync-on-join: if there's an active video, trigger download + sync
                 current_vid = data.get("current_video")
                 if current_vid:
@@ -699,6 +732,9 @@ class SessionClient:
             elif msg_type == "transition_busy":
                 self.signals.transition_busy.emit(data.get("message", "A clip is already being loaded."))
 
+            elif msg_type == "queue_updated":
+                self.signals.queue_updated.emit(data.get("queue", []))
+
         except json.JSONDecodeError:
             log.warning(f"Invalid JSON from server: {message[:100]}")
         except Exception as e:
@@ -732,7 +768,7 @@ class SessionClient:
     # Internal: Upload / Download
     # ====================================================================
 
-    def _upload_thread(self, filepath: str, prefetch: bool = False):
+    def _upload_thread(self, filepath: str, prefetch: bool = False, skip_play: bool = False):
         """Upload a video file using resumable chunked upload, then tell the room to play it."""
         try:
             if not os.path.exists(filepath):
@@ -850,6 +886,9 @@ class SessionClient:
             if prefetch:
                 # Prefetch mode: notify server but don't trigger play_video or UI
                 self.send_prefetch_uploaded(video_id)
+            elif skip_play:
+                # Upload-only mode (for queue): emit uploaded signal but don't trigger play
+                self.signals.video_uploaded.emit(video_id, filename, file_size, self._username)
             else:
                 # Tell room to play this video (server starts ready-sync)
                 self.send_play_video(video_id)
@@ -881,17 +920,17 @@ class SessionClient:
             safe_name = os.path.basename(filename).replace("..", "_")
             local_path = str(self._download_dir / f"{safe_vid}_{safe_name}")
 
-            resp = requests.get(url, stream=True, timeout=600)
-            if resp.status_code not in (200, 206):
-                self.signals.room_error.emit(f"Download failed: {resp.status_code}")
-                return
-
-            received = 0
-            with open(local_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=262144):  # 256KB
-                    f.write(chunk)
-                    received += len(chunk)
-                    self.signals.download_progress.emit(received, total_size)
+            # Use parallel download for large files where server supports Range
+            if total_size >= PARALLEL_DOWNLOAD_THRESHOLD:
+                # Verify server supports Range requests
+                head_resp = requests.head(url, timeout=30)
+                accept_ranges = head_resp.headers.get("Accept-Ranges", "")
+                if accept_ranges == "bytes" and total_size > 0:
+                    self._parallel_download(url, local_path, total_size)
+                else:
+                    self._single_stream_download(url, local_path, total_size)
+            else:
+                self._single_stream_download(url, local_path, total_size)
 
             # Store local path
             if video_id in self._videos:
@@ -906,4 +945,71 @@ class SessionClient:
             self.signals.room_error.emit(f"Download error: {e}")
         finally:
             self._downloading.discard(video_id)
+
+    def _single_stream_download(self, url: str, local_path: str, total_size: int):
+        """Download a file in a single streaming request."""
+        resp = requests.get(url, stream=True, timeout=600)
+        if resp.status_code not in (200, 206):
+            raise RuntimeError(f"Download failed: {resp.status_code}")
+
+        received = 0
+        with open(local_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=262144):  # 256KB
+                f.write(chunk)
+                received += len(chunk)
+                self.signals.download_progress.emit(received, total_size)
+
+    def _parallel_download(self, url: str, local_path: str, total_size: int):
+        """Download a file using multiple parallel Range requests."""
+        import concurrent.futures
+
+        num_segments = DOWNLOAD_SEGMENTS
+        segment_size = total_size // num_segments
+        segments = []
+        for i in range(num_segments):
+            start = i * segment_size
+            end = total_size - 1 if i == num_segments - 1 else (i + 1) * segment_size - 1
+            segments.append((i, start, end))
+
+        # Track progress across all segments
+        segment_received = [0] * num_segments
+        segment_paths = [f"{local_path}.part{i}" for i in range(num_segments)]
+
+        def _download_segment(seg_index: int, byte_start: int, byte_end: int):
+            headers = {"Range": f"bytes={byte_start}-{byte_end}"}
+            resp = requests.get(url, headers=headers, stream=True, timeout=600)
+            if resp.status_code not in (200, 206):
+                raise RuntimeError(f"Segment {seg_index} failed: {resp.status_code}")
+            with open(segment_paths[seg_index], "wb") as f:
+                for chunk in resp.iter_content(chunk_size=262144):
+                    f.write(chunk)
+                    segment_received[seg_index] += len(chunk)
+                    total_received = sum(segment_received)
+                    self.signals.download_progress.emit(total_received, total_size)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_segments) as executor:
+                futures = [
+                    executor.submit(_download_segment, idx, start, end)
+                    for idx, start, end in segments
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()  # Raises on error
+
+            # Merge segment files
+            with open(local_path, "wb") as out:
+                for part_path in segment_paths:
+                    with open(part_path, "rb") as part:
+                        while True:
+                            chunk = part.read(262144)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+        finally:
+            # Clean up segment files
+            for part_path in segment_paths:
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
 

@@ -94,6 +94,7 @@ class Room:
     pending_random_request: Optional[dict] = None        # {target_uid, requester_uid, tried: []}
     pending_prefetch_request: Optional[dict] = None      # {target_uid, tried: []}
     pending_uploads: dict = field(default_factory=dict)  # upload_id -> chunked upload metadata
+    queue: list = field(default_factory=list)             # ordered list of queued videos [{video_id, filename, added_by, added_by_name}]
     playback_state: dict = field(default_factory=lambda: {
         "playing": False,
         "position": 0.0,       # 0.0 - 1.0
@@ -110,7 +111,11 @@ class Room:
 
     def user_list(self) -> list:
         return [
-            {"user_id": u.user_id, "username": u.username}
+            {
+                "user_id": u.user_id,
+                "username": u.username,
+                "pool_opted_in": (self.pool_opted_in.get(u.user_id, {}) or {}).get("opted_in", False),
+            }
             for u in self.users.values()
         ]
 
@@ -202,6 +207,16 @@ class ServerState:
                 stale_ips.append(ip)
         for ip in stale_ips:
             del self.join_attempts[ip]
+
+        # Clean up stale auth tokens (user called /join but never opened WS)
+        stale_tokens = [
+            uid for uid, rcode in self.authenticated_users.items()
+            if rcode not in self.rooms
+        ]
+        for uid in stale_tokens:
+            del self.authenticated_users[uid]
+        if stale_tokens:
+            log.info(f"Cleaned up {len(stale_tokens)} stale auth token(s)")
 
         # Clean up stale chunked uploads (>30min) in active rooms
         now = time.time()
@@ -589,6 +604,7 @@ async def stream_video(room_code: str, video_id: str, request: Request):
         raise HTTPException(404, "Room not found")
 
     room = state.rooms[room_code]
+    room.touch()
     video_meta = room.videos.get(video_id)
     if not video_meta:
         raise HTTPException(404, "Video not found")
@@ -694,6 +710,9 @@ async def broadcast(room: Room, message: dict, exclude_id: Optional[str] = None)
 async def _ready_timeout(room: Room, video_id: str, timeout: float):
     """Force-start playback if not everyone is ready within the timeout."""
     await asyncio.sleep(timeout)
+    # Guard: room may have been deleted during the sleep
+    if room.room_code not in state.rooms:
+        return
     if room.pending_video == video_id:
         log.info(f"Ready-sync timeout for {video_id} — forcing start")
         room.pending_video = None
@@ -847,6 +866,8 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                 vid: {"filename": meta["filename"], "size": meta["size"]}
                 for vid, meta in room.videos.items()
             },
+            "queue": room.queue,
+            "shared_pool": room.shared_pool,
         })
 
         # Notify others that user joined
@@ -932,18 +953,23 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                     room.playback_state["position"] = 0.0
                     room.playback_state["timestamp"] = time.time()
                     room.pending_video = video_id
-                    room.ready_users = {user_id}  # Sharer is already ready
-                    # Tell all OTHER users to prepare this video
+                    uploaded_by = room.videos[video_id].get("uploaded_by", "")
+                    # Only mark sender ready if they uploaded the video
+                    if uploaded_by == user_id:
+                        room.ready_users = {user_id}
+                    else:
+                        room.ready_users = set()
+                    # Tell users to prepare (exclude sender only if they have it)
+                    exclude = user_id if uploaded_by == user_id else None
                     await broadcast(room, {
                         "type": "prepare_video",
                         "video_id": video_id,
                         "filename": room.videos[video_id]["filename"],
                         "user": username,
                         "timestamp": room.playback_state["timestamp"],
-                    }, exclude_id=user_id)
-                    # Check if sharer is the only user — start immediately
-                    uploaded_by = room.videos[video_id].get("uploaded_by", "")
-                    if len(room.users) <= 1:
+                    }, exclude_id=exclude)
+                    # Check if sender is the only user and has the file — start immediately
+                    if len(room.users) <= 1 and uploaded_by == user_id:
                         room.pending_video = None
                         room.playback_state["playing"] = True
                         room.playback_state["timestamp"] = time.time()
@@ -1143,6 +1169,133 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                         "filename": filename,
                     })
                     log.info(f"Prefetch available: {filename} in room {room_code}")
+
+            elif msg_type == "queue_add":
+                # Add a video to the room queue
+                video_id = data.get("video_id")
+                if not video_id or video_id not in room.videos:
+                    await websocket.send_json({"type": "error", "message": "Video not found"})
+                    continue
+                filename = room.videos[video_id].get("filename", "unknown")
+                # Prevent duplicates in queue
+                if any(item["video_id"] == video_id for item in room.queue):
+                    await websocket.send_json({"type": "error", "message": "Already in queue"})
+                    continue
+                room.queue.append({
+                    "video_id": video_id,
+                    "filename": filename,
+                    "added_by": user_id,
+                    "added_by_name": username,
+                })
+                await broadcast(room, {
+                    "type": "queue_updated",
+                    "queue": room.queue,
+                })
+                log.info(f"Queue add: {filename} by {username} in room {room_code}")
+
+            elif msg_type == "queue_remove":
+                # Remove a video from the queue
+                video_id = data.get("video_id")
+                if video_id:
+                    before = len(room.queue)
+                    room.queue = [item for item in room.queue if item["video_id"] != video_id]
+                    if len(room.queue) < before:
+                        await broadcast(room, {
+                            "type": "queue_updated",
+                            "queue": room.queue,
+                        })
+                        log.info(f"Queue remove: {video_id} in room {room_code}")
+
+            elif msg_type == "queue_reorder":
+                # Move a queue item to a new position
+                video_id = data.get("video_id")
+                new_index = data.get("new_index")
+                if video_id is not None and isinstance(new_index, int):
+                    # Find and remove the item
+                    item = None
+                    for i, q_item in enumerate(room.queue):
+                        if q_item["video_id"] == video_id:
+                            item = room.queue.pop(i)
+                            break
+                    if item is None:
+                        await websocket.send_json({"type": "error", "message": "Item not found in queue"})
+                        continue
+                    new_index = max(0, min(new_index, len(room.queue)))
+                    room.queue.insert(new_index, item)
+                    await broadcast(room, {
+                        "type": "queue_updated",
+                        "queue": room.queue,
+                    })
+                    log.info(f"Queue reorder: {video_id} → index {new_index} in room {room_code}")
+
+            elif msg_type == "queue_play_next":
+                # Pop items from the queue until we find a valid video or exhaust it
+                if not room.queue:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Queue is empty",
+                    })
+                    continue
+                if room.pending_video is not None:
+                    await websocket.send_json({
+                        "type": "transition_busy",
+                        "message": "A clip is already being loaded.",
+                        "pending_video_id": room.pending_video,
+                    })
+                    continue
+                # Skip deleted videos until we find a valid one
+                next_video_id = None
+                while room.queue:
+                    next_item = room.queue.pop(0)
+                    vid = next_item["video_id"]
+                    if vid in room.videos:
+                        next_video_id = vid
+                        break
+                    log.info(f"Queue skip deleted: {vid} in room {room_code}")
+                # Broadcast updated queue regardless (items were popped)
+                await broadcast(room, {
+                    "type": "queue_updated",
+                    "queue": room.queue,
+                })
+                if next_video_id is None:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Queue exhausted (all videos were deleted)",
+                    })
+                    continue
+                # Start ready-sync (same as play_video)
+                room.current_video = next_video_id
+                room.playback_state["playing"] = False
+                room.playback_state["position"] = 0.0
+                room.playback_state["timestamp"] = time.time()
+                room.pending_video = next_video_id
+                # Sender may not have the file — only mark ready if they uploaded it
+                uploaded_by = room.videos[next_video_id].get("uploaded_by", "")
+                if uploaded_by == user_id:
+                    room.ready_users = {user_id}
+                else:
+                    room.ready_users = set()
+                # Tell users to prepare (exclude sender only if they uploaded it)
+                exclude = user_id if uploaded_by == user_id else None
+                await broadcast(room, {
+                    "type": "prepare_video",
+                    "video_id": next_video_id,
+                    "filename": room.videos[next_video_id]["filename"],
+                    "user": username,
+                    "timestamp": room.playback_state["timestamp"],
+                }, exclude_id=exclude)
+                if len(room.users) <= 1 and uploaded_by == user_id:
+                    room.pending_video = None
+                    room.playback_state["playing"] = True
+                    room.playback_state["timestamp"] = time.time()
+                    await websocket.send_json({
+                        "type": "all_ready",
+                        "video_id": next_video_id,
+                        "uploaded_by": uploaded_by,
+                    })
+                else:
+                    log.info(f"Queue play next: {next_video_id} in room {room_code}")
+                    asyncio.create_task(_ready_timeout(room, next_video_id, 30.0))
 
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})

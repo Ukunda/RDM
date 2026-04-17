@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Random Clip Player - A polished video clip player with random playback
 Version 4.5 - Bugfix & Stability
@@ -111,13 +112,16 @@ class ConfigManager:
     """Handles loading and saving of application settings"""
     
     def __init__(self):
-        appdata = os.environ.get('APPDATA')
-        if appdata:
-            self.config_dir = Path(appdata) / "RandomClipPlayer"
-            self.config_dir.mkdir(parents=True, exist_ok=True)
-            self.config_file = self.config_dir / "config.json"
+        if sys.platform == 'win32':
+            appdata = os.environ.get('APPDATA', '')
+            self.config_dir = Path(appdata) / "RandomClipPlayer" if appdata else Path.home() / "RandomClipPlayer"
+        elif sys.platform == 'darwin':
+            self.config_dir = Path.home() / "Library" / "Application Support" / "RandomClipPlayer"
         else:
-            self.config_file = Path("config.json")
+            xdg = os.environ.get('XDG_CONFIG_HOME', '')
+            self.config_dir = Path(xdg) / "RandomClipPlayer" if xdg else Path.home() / ".config" / "RandomClipPlayer"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.config_file = self.config_dir / "config.json"
         self.default_config = {
             "clips_folder": "",
             "volume": 80,
@@ -203,56 +207,162 @@ class ConfigManager:
         self.save_config()
 
 class BlockedListDialog(QDialog):
-    """Dialog to manage blocked clips"""
+    """Dialog to manage blocked/disliked clips"""
     
-    def __init__(self, blocked_clips, parent=None):
+    def __init__(self, blocked_clips, restore_map=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Manage Blocked Clips")
-        self.setMinimumSize(500, 400)
+        self.setWindowTitle("Manage Disliked Clips")
+        self.setMinimumSize(550, 450)
         self.blocked_clips = sorted(list(blocked_clips))
         self.removed_clips = set()
+        self.delete_all_requested = False
+        self._restore_map = restore_map or {}
         
         layout = QVBoxLayout(self)
+        layout.setSpacing(8)
         
-        # Info label
-        layout.addWidget(QLabel("Select clips to unblock:"))
+        # Header with count
+        header = QLabel(f"👎 {len(self.blocked_clips)} disliked clip{'s' if len(self.blocked_clips) != 1 else ''}")
+        header.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: bold; border: none;")
+        layout.addWidget(header)
+        
+        info = QLabel("Select clips to unblock, or permanently delete all disliked files.")
+        info.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; border: none;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
         
         # List widget
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+        self.list_widget.setToolTip("Double-click to reveal in Explorer")
+        self.list_widget.itemDoubleClicked.connect(self._open_in_explorer)
         
         for clip in self.blocked_clips:
-            item = QListWidgetItem(os.path.basename(clip))
+            filename = os.path.basename(clip)
+            # Check if it's in trash
+            in_trash = any(orig == clip for orig in self._restore_map.values())
+            label = f"🗑 {filename}" if in_trash else f"🚫 {filename}"
+            item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, clip)
+            item.setToolTip(clip)
             self.list_widget.addItem(item)
             
         layout.addWidget(self.list_widget)
         
-        # Buttons
-        btn_layout = QHBoxLayout()
+        # Buttons row 1: unblock
+        btn_layout1 = QHBoxLayout()
+        btn_layout1.setSpacing(8)
         
-        unblock_btn = QPushButton("Unblock Selected")
+        unblock_btn = QPushButton("✅  Unblock Selected")
         unblock_btn.clicked.connect(self.unblock_selected)
+        unblock_btn.setStyleSheet(self._action_btn_style(COLORS['accent_green']))
+        btn_layout1.addWidget(unblock_btn)
+        
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(self.list_widget.selectAll)
+        select_all_btn.setStyleSheet(self._action_btn_style(COLORS['bg_light']))
+        btn_layout1.addWidget(select_all_btn)
+
+        layout.addLayout(btn_layout1)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {COLORS['border']};")
+        layout.addWidget(sep)
+
+        # Buttons row 2: destructive + close
+        btn_layout2 = QHBoxLayout()
+        btn_layout2.setSpacing(8)
+        
+        delete_all_btn = QPushButton("🗑  Permanently Delete All Disliked")
+        delete_all_btn.setStyleSheet(self._action_btn_style(COLORS['accent_red']))
+        delete_all_btn.clicked.connect(self._on_delete_all)
+        btn_layout2.addWidget(delete_all_btn)
+
+        btn_layout2.addStretch()
         
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
+        close_btn.setStyleSheet(self._action_btn_style(COLORS['bg_light']))
+        btn_layout2.addWidget(close_btn)
         
-        btn_layout.addWidget(unblock_btn)
-        btn_layout.addWidget(close_btn)
-        
-        layout.addLayout(btn_layout)
+        layout.addLayout(btn_layout2)
         
         self.apply_styles()
-        
+
+    def _action_btn_style(self, bg_color):
+        return f"""
+            QPushButton {{
+                background-color: {bg_color};
+                color: {COLORS['text_primary']};
+                border: none;
+                border-radius: 4px;
+                padding: 7px 14px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ opacity: 0.85; }}
+        """
+
+    def _on_delete_all(self):
+        if not self.blocked_clips:
+            return
+        count = len(self.blocked_clips)
+        reply = QMessageBox.warning(
+            self, "Delete All Disliked",
+            f"This will permanently delete {count} disliked file{'s' if count != 1 else ''} from disk.\n\n"
+            "This cannot be undone!\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.delete_all_requested = True
+            self.accept()
+            
     def unblock_selected(self):
         selected_items = self.list_widget.selectedItems()
         for item in selected_items:
             clip_path = item.data(Qt.ItemDataRole.UserRole)
             self.removed_clips.add(clip_path)
             self.list_widget.takeItem(self.list_widget.row(item))
+        # Update header
+        remaining = self.list_widget.count()
+        header = self.findChild(QLabel)
+        if header:
+            header.setText(f"👎 {remaining} disliked clip{'s' if remaining != 1 else ''}")
             
     def get_removed_clips(self):
         return self.removed_clips
+
+    def _open_in_explorer(self, item):
+        """Open the file's location in Explorer on double-click."""
+        clip_path = item.data(Qt.ItemDataRole.UserRole)
+        # If the original file exists, reveal it
+        if os.path.exists(clip_path):
+            target = clip_path
+        else:
+            # Check if it was trashed
+            target = None
+            for key, original in self._restore_map.items():
+                if original == clip_path:
+                    clips_dir = os.path.dirname(clip_path)
+                    trash_path = os.path.join(clips_dir, ".trash", key)
+                    if os.path.exists(trash_path):
+                        target = trash_path
+                    break
+        if target:
+            try:
+                if sys.platform == 'win32':
+                    import ctypes
+                    ctypes.windll.shell32.ShellExecuteW(
+                        None, "open", "explorer.exe", f'/select,"{target}"', None, 1
+                    )
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(['open', '-R', target])
+                else:
+                    subprocess.Popen(['xdg-open', os.path.dirname(target)])
+            except Exception:
+                pass
 
     def apply_styles(self):
         self.setStyleSheet(f"""
@@ -1311,6 +1421,145 @@ class StyledButton(QPushButton):
 
 
 # ============================================================================
+# Video Queue Widget
+# ============================================================================
+
+class QueueWidget(QFrame):
+    """Displays and manages the video queue in the session panel."""
+
+    play_next_requested = Signal()         # User clicked "Play Next"
+    remove_requested = Signal(str)         # video_id to remove
+    reorder_requested = Signal(str, int)   # (video_id, new_index)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"border: none;")
+        self._queue_items: list = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # Header row with label + play next button
+        header_row = QHBoxLayout()
+        header_row.setSpacing(4)
+        label = QLabel("📋 Queue")
+        label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; border: none;")
+        header_row.addWidget(label, stretch=1)
+
+        self.queue_count_label = QLabel("0 items")
+        self.queue_count_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; border: none;")
+        header_row.addWidget(self.queue_count_label)
+
+        layout.addLayout(header_row)
+
+        # Queue list
+        self.queue_list = QListWidget()
+        self.queue_list.setMaximumHeight(120)
+        self.queue_list.setDragDropMode(QListWidget.InternalMove)
+        self.queue_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.queue_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.queue_list.customContextMenuRequested.connect(self._show_context_menu)
+        self.queue_list.model().rowsMoved.connect(self._on_rows_moved)
+        self.queue_list.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {COLORS['bg_dark']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                color: {COLORS['text_primary']};
+                font-size: 10px;
+            }}
+            QListWidget::item {{
+                padding: 3px 6px;
+            }}
+            QListWidget::item:selected {{
+                background-color: {COLORS['bg_light']};
+            }}
+        """)
+        layout.addWidget(self.queue_list)
+
+        # Play Next button
+        self.play_next_btn = QPushButton("⏭  Play Next in Queue")
+        self.play_next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.play_next_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['accent_blue']};
+                color: {COLORS['text_primary']};
+                border: none;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 11px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{ opacity: 0.85; }}
+            QPushButton:disabled {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_muted']};
+            }}
+        """)
+        self.play_next_btn.setEnabled(False)
+        self.play_next_btn.clicked.connect(self.play_next_requested.emit)
+        layout.addWidget(self.play_next_btn)
+
+    def update_queue(self, items: list):
+        """Replace the queue display with the given items."""
+        self._queue_items = items
+        self.queue_list.clear()
+        for item in items:
+            filename = item.get("filename", "unknown")
+            added_by = item.get("added_by_name", "")
+            display = f"{filename}"
+            if added_by:
+                display += f"  ({added_by})"
+            list_item = QListWidgetItem(display)
+            list_item.setData(Qt.ItemDataRole.UserRole, item.get("video_id", ""))
+            self.queue_list.addItem(list_item)
+        count = len(items)
+        self.queue_count_label.setText(f"{count} item{'s' if count != 1 else ''}")
+        self.play_next_btn.setEnabled(count > 0)
+
+    def _show_context_menu(self, pos):
+        """Right-click to remove an item from the queue."""
+        item = self.queue_list.itemAt(pos)
+        if not item:
+            return
+        video_id = item.data(Qt.ItemDataRole.UserRole)
+        if not video_id:
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+            }}
+            QMenu::item {{ padding: 6px 24px; }}
+            QMenu::item:selected {{ background-color: {COLORS['accent_red']}; }}
+        """)
+        remove_action = menu.addAction("🗑 Remove from Queue")
+        viewport = self.queue_list.viewport()
+        assert viewport is not None
+        action = menu.exec(viewport.mapToGlobal(pos))
+        if action == remove_action:
+            self.remove_requested.emit(video_id)
+
+    def _on_rows_moved(self):
+        """Handle drag-and-drop reorder within the list."""
+        # After internal move, read the new order and emit reorder for the moved item
+        for i in range(self.queue_list.count()):
+            item = self.queue_list.item(i)
+            if not item:
+                continue
+            video_id = item.data(Qt.ItemDataRole.UserRole)
+            # Find original position
+            for j, orig in enumerate(self._queue_items):
+                if orig.get("video_id") == video_id and j != i:
+                    self.reorder_requested.emit(video_id, i)
+                    return
+
+
+# ============================================================================
 # Session Panel (Watch Together)
 # ============================================================================
 
@@ -1326,6 +1575,7 @@ class SessionPanel(QFrame):
         self.session_client = None
         self._player = parent  # Reference to VideoPlayer
         self.setAcceptDrops(True)  # Enable drag & drop for video sharing
+        self._queue_after_upload = False  # Flag: add to queue after upload completes
 
         # Pending sync state (set when joining mid-session)
         self._pending_sync_state: dict = {}
@@ -1543,12 +1793,19 @@ class SessionPanel(QFrame):
 
         sess_layout.addWidget(self._make_separator())
 
-        # Share clip button (also drop hint)
-        self.share_btn = QPushButton("📤  Share Current Clip")
+        # Share clip button
+        self.share_btn = QPushButton("📤  Share a Clip")
         self.share_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.share_btn.setStyleSheet(self._btn_style(COLORS['accent_orange']))
         self.share_btn.clicked.connect(self._share_current_clip)
         sess_layout.addWidget(self.share_btn)
+
+        # Add to Queue button
+        self.add_to_queue_btn = QPushButton("📋  Add to Queue")
+        self.add_to_queue_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_to_queue_btn.setStyleSheet(self._btn_style(COLORS['accent_blue']))
+        self.add_to_queue_btn.clicked.connect(self._add_current_to_queue)
+        sess_layout.addWidget(self.add_to_queue_btn)
 
         # Drop hint
         self.drop_hint = QLabel("📂  or drag && drop a video file here")
@@ -1569,6 +1826,15 @@ class SessionPanel(QFrame):
         self.now_playing_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; border: none;")
         self.now_playing_label.setWordWrap(True)
         sess_layout.addWidget(self.now_playing_label)
+
+        sess_layout.addWidget(self._make_separator())
+
+        # Video Queue
+        self.queue_widget = QueueWidget()
+        self.queue_widget.play_next_requested.connect(self._on_play_next_requested)
+        self.queue_widget.remove_requested.connect(self._on_queue_item_removed)
+        self.queue_widget.reorder_requested.connect(self._on_queue_item_reordered)
+        sess_layout.addWidget(self.queue_widget)
 
         sess_layout.addWidget(self._make_separator())
 
@@ -1812,16 +2078,26 @@ class SessionPanel(QFrame):
             copy_btn = self.copy_code_btn
             QTimer.singleShot(1500, lambda: copy_btn.setText("📋 Copy"))
 
+    def _pick_clip_file(self) -> str:
+        """Open a file picker starting in the clips folder. Returns path or empty string."""
+        start_dir = ""
+        if self._player and self._player.clips_folder and os.path.isdir(self._player.clips_folder):
+            start_dir = self._player.clips_folder
+        exts = " ".join(f"*{e}" for e in sorted(VIDEO_EXTENSIONS))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select a clip", start_dir, f"Video files ({exts});;All files (*)"
+        )
+        return path
+
     def _share_current_clip(self):
         if not self.session_client or not self.session_client.is_connected:
             self.progress_label.setText("Not connected")
             return
-        player = self._player
-        if player and player.current_video and os.path.exists(player.current_video):
-            self.progress_label.setText("⏳ Uploading...")
-            self.session_client.upload_and_play(player.current_video)
-        else:
-            self.progress_label.setText("No clip loaded")
+        filepath = self._pick_clip_file()
+        if not filepath:
+            return
+        self.progress_label.setText("⏳ Uploading...")
+        self.session_client.upload_and_play(filepath)
 
     # ---- Signal Wiring ----
 
@@ -1866,6 +2142,9 @@ class SessionPanel(QFrame):
 
         # Transition lock — server rejected our play_video because one is pending
         c.transition_busy.connect(self._on_transition_busy)
+
+        # Queue signals
+        c.queue_updated.connect(self._on_queue_updated)
 
         # Playback signals → forwarded to VideoPlayer (and logged in activity)
         if self._player:
@@ -1914,8 +2193,12 @@ class SessionPanel(QFrame):
         self.users_list.clear()
         self.activity_feed.clear()
         username = self.username_input.text().strip()
-        self.users_list.addItem(f"👑 {username} (you)")
+        self.users_list.addItem(f"👑 {username} (you) 🎲")
+        self._users_data = [{"user_id": user_id, "username": username, "pool_opted_in": True}]
         self.add_activity(f"🏠 Room {room_code} created")
+        # Host always has control over shared pool toggle
+        self.shared_pool_cb.setEnabled(True)
+        self.shared_pool_cb.setToolTip("When on, Random Clip picks from a random user's gallery")
         # Update connection dot
         if self._player:
             self._player._update_session_dot(True)
@@ -1933,6 +2216,21 @@ class SessionPanel(QFrame):
         # Only clear activity if this is the first join (not a reconnect)
         was_reconnect = self.activity_feed.count() > 0
         self._update_users_list(users)
+        # Sync shared pool state from server
+        if isinstance(data, dict):
+            shared_pool = data.get("shared_pool", False)
+            self.shared_pool_cb.blockSignals(True)
+            self.shared_pool_cb.setChecked(shared_pool)
+            self.shared_pool_cb.blockSignals(False)
+            if self._player:
+                self._player._session_shared_pool = shared_pool
+        # Disable shared pool toggle for non-host users
+        is_host = bool(self.session_client and self.session_client.is_host)
+        self.shared_pool_cb.setEnabled(is_host)
+        if not is_host:
+            self.shared_pool_cb.setToolTip("Only the host can toggle the shared random pool")
+        else:
+            self.shared_pool_cb.setToolTip("When on, Random Clip picks from a random user's gallery")
         if was_reconnect:
             self.add_activity("🔄 Reconnected")
         else:
@@ -1940,6 +2238,11 @@ class SessionPanel(QFrame):
         # Update connection dot
         if self._player:
             self._player._update_session_dot(True)
+        # Send initial pool opt-in with clip count so server knows we're eligible
+        if self.session_client and self.session_client.is_connected and self._player:
+            clip_count = len(self._player.play_queue)
+            opted_in = self.pool_opt_in_cb.isChecked()
+            self.session_client.send_pool_opt_in(opted_in, clip_count)
 
     def _on_sync_to_video(self, video_id, filename, playback_state):
         """Sync to the video currently playing when joining mid-session."""
@@ -1980,7 +2283,8 @@ class SessionPanel(QFrame):
             uname = u.get("username", "Unknown")
             prefix = "👑 " if self.session_client and uid == self.session_client._host_id else ""
             suffix = " (you)" if self.session_client and uid == self.session_client.user_id else ""
-            self.users_list.addItem(f"{prefix}{uname}{suffix}")
+            pool_icon = " 🎲" if u.get("pool_opted_in") else ""
+            self.users_list.addItem(f"{prefix}{uname}{suffix}{pool_icon}")
 
     def _show_user_context_menu(self, pos):
         """Right-click context menu on users list — host can kick."""
@@ -2037,13 +2341,63 @@ class SessionPanel(QFrame):
             self._player.status_label.setText(f"⏳ {msg}")
             QTimer.singleShot(3000, self._player._update_status_bar)
 
+    # ---- Queue handlers ----
+
+    def _on_queue_updated(self, items: list):
+        """Server sent updated queue list."""
+        self.queue_widget.update_queue(items)
+        if self._player:
+            self._player._session_queue = items
+
+    def _on_play_next_requested(self):
+        """User clicked 'Play Next' — tell the server."""
+        if self.session_client:
+            self.session_client.send_queue_play_next()
+
+    def _on_queue_item_removed(self, video_id: str):
+        """User removed item from queue via context menu."""
+        if self.session_client:
+            self.session_client.send_queue_remove(video_id)
+
+    def _on_queue_item_reordered(self, video_id: str, new_index: int):
+        """User drag-dropped an item to a new position."""
+        if self.session_client:
+            self.session_client.send_queue_reorder(video_id, new_index)
+
+    def _add_current_to_queue(self):
+        """Pick a clip via file dialog and add to queue."""
+        if not self.session_client or not self._player:
+            return
+        filepath = self._pick_clip_file()
+        if not filepath:
+            return
+        filename = os.path.basename(filepath)
+        # Check if already uploaded — if so, add directly; otherwise upload first
+        video_id = None
+        for vid, info in self.session_client._videos.items():
+            if info.get("filename") == filename:
+                video_id = vid
+                break
+        if video_id:
+            self.session_client.send_queue_add(video_id)
+            self.add_activity(f"📋 Added {filename} to queue")
+        else:
+            # Upload then queue — use a flag to queue after upload
+            self._queue_after_upload = True
+            self.progress_label.setText("⏳ Uploading to queue...")
+            self.add_activity(f"📤 Uploading {filename} for queue...")
+            self.session_client.upload_video(filepath)
+
     def _show_disconnected(self, reason=""):
         self.connect_section.setVisible(True)
         self.session_section.setVisible(False)
         self.connection_status.setText(f"Disconnected: {reason}" if reason else "Disconnected")
         self.connection_status.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; border: none;")
         self.session_client = None
+        self.shared_pool_cb.blockSignals(True)
         self.shared_pool_cb.setChecked(False)
+        self.shared_pool_cb.setEnabled(True)
+        self.shared_pool_cb.blockSignals(False)
         # Update connection dot and reset shared pool
         if self._player:
             self._player._update_session_dot(False)
@@ -2053,6 +2407,8 @@ class SessionPanel(QFrame):
             self._player._heartbeat_timer.stop()
             self._player._prefetch_video_id = None
             self._player._prefetch_timer.stop()
+            self._player._session_queue = []
+        self.queue_widget.update_queue([])
 
     def _on_upload_progress(self, sent, total):
         if total > 0:
@@ -2084,6 +2440,11 @@ class SessionPanel(QFrame):
         # Hide overlay
         if self._player and hasattr(self._player, '_transfer_overlay'):
             self._player._transfer_overlay.finish()
+        # If we uploaded for queueing, add to queue now
+        if self._queue_after_upload and self.session_client:
+            self._queue_after_upload = False
+            self.session_client.send_queue_add(video_id)
+            self.add_activity(f"📋 Added {filename} to queue")
 
     def _on_video_ready(self, video_id, local_path):
         self.progress_label.setText("✅ Video ready")
@@ -2196,12 +2557,17 @@ class SessionPanel(QFrame):
             # Check if WE uploaded this clip — don't mark as remote if so
             own_id = self.session_client.user_id if self.session_client else None
             self._player._playing_remote_clip = (uploaded_by != own_id)
-            self._player._ignore_remote = True
-            self._player.player.seek(0, reference='absolute')
-            self._player.player.pause = False
-            self._player.play_btn.setText("⏸  Pause")
-            self._player._apply_current_speed()
-            self._player._ignore_remote = False
+            # If the video isn't currently loaded (e.g. queue item), load it first
+            local_path = self.session_client.get_local_video_path(video_id) if self.session_client else None
+            if local_path and os.path.normpath(local_path) != os.path.normpath(self._player.current_video or ""):
+                self._player._play_session_video(video_id, local_path)
+            else:
+                self._player._ignore_remote = True
+                self._player.player.seek(0, reference='absolute')
+                self._player.player.pause = False
+                self._player.play_btn.setText("⏸  Pause")
+                self._player._apply_current_speed()
+                self._player._ignore_remote = False
             # Only start heartbeat for host (non-host _send_position_heartbeat returns early)
             if self._player.is_host_in_session():
                 self._player._heartbeat_timer.start()
@@ -2256,6 +2622,13 @@ class SessionPanel(QFrame):
         """Another user changed their pool opt-in status."""
         icon = "🎲" if opted_in else "—"
         self.add_activity(f"{icon} {username} {'joined' if opted_in else 'left'} the clip pool")
+        # Update stored user data and refresh the list
+        if hasattr(self, '_users_data'):
+            for u in self._users_data:
+                if u.get("username") == username:
+                    u["pool_opted_in"] = opted_in
+                    break
+            self._update_users_list(self._users_data)
 
     def _on_random_failed(self, message):
         """Random clip request failed after retries."""
@@ -2578,6 +2951,7 @@ class VideoPlayer(QMainWindow):
         self._heartbeat_timer.setInterval(5000)
         self._heartbeat_timer.timeout.connect(self._send_position_heartbeat)
         self._prefetch_video_id: str | None = None   # video_id of prefetched clip
+        self._session_queue: list = []               # Current session video queue
         self._prefetch_timer = QTimer()
         self._prefetch_timer.setInterval(3000)
         self._prefetch_timer.setSingleShot(True)
@@ -2679,7 +3053,7 @@ class VideoPlayer(QMainWindow):
         open_explorer_action.triggered.connect(self.open_current_in_explorer)
         file_menu.addAction(open_explorer_action)
 
-        manage_blocked_action = QAction("Manage Blocked Clips...", self)
+        manage_blocked_action = QAction("Manage Disliked Clips...", self)
         manage_blocked_action.triggered.connect(self.show_blocked_dialog)
         file_menu.addAction(manage_blocked_action)
         
@@ -2785,8 +3159,13 @@ class VideoPlayer(QMainWindow):
 
     def show_blocked_dialog(self):
         """Show dialog to manage blocked clips"""
-        dialog = BlockedListDialog(self.blocked_clips, self)
+        restore_map = self.config_manager.get("restore_map") or {}
+        dialog = BlockedListDialog(self.blocked_clips, restore_map, self)
         if dialog.exec():
+            # Handle "Delete All Disliked" action
+            if dialog.delete_all_requested:
+                self._delete_all_disliked()
+                return
             removed = dialog.get_removed_clips()
             if removed:
                 self.blocked_clips -= removed
@@ -2819,6 +3198,52 @@ class VideoPlayer(QMainWindow):
                     msg += f" ({restored_count} restored from trash)"
                 self.video_label.setText(msg)
                 QTimer.singleShot(2000, lambda: self._update_status_bar() if not self.current_video else None)
+
+    def _delete_all_disliked(self):
+        """Permanently delete all disliked clips from disk."""
+        restore_map = self.config_manager.get("restore_map") or {}
+        deleted = 0
+        errors = 0
+
+        for clip_path in list(self.blocked_clips):
+            # Check if the clip was trashed (moved to .trash)
+            trash_key = None
+            for key, original in restore_map.items():
+                if original == clip_path:
+                    trash_key = key
+                    break
+
+            if trash_key:
+                # Delete from .trash folder
+                clips_dir = os.path.dirname(clip_path)
+                trash_path = os.path.join(clips_dir, ".trash", trash_key)
+                if os.path.exists(trash_path):
+                    try:
+                        os.remove(trash_path)
+                        deleted += 1
+                    except Exception:
+                        errors += 1
+                del restore_map[trash_key]
+            else:
+                # Delete original file directly (blacklisted but not trashed)
+                if os.path.exists(clip_path):
+                    try:
+                        os.remove(clip_path)
+                        deleted += 1
+                    except Exception:
+                        errors += 1
+
+        # Clear blocked list and restore map
+        self.blocked_clips.clear()
+        self.config_manager.set("blocked_clips", [])
+        self.config_manager.set("restore_map", {})
+
+        msg = f"🗑 Permanently deleted {deleted} clips"
+        if errors:
+            msg += f" ({errors} failed)"
+        self.video_label.setText(msg)
+        QTimer.singleShot(3000, self._update_status_bar)
+        self._refresh_queue()
 
     def _setup_ui(self):
         """Initialize all UI components"""
@@ -3252,6 +3677,12 @@ class VideoPlayer(QMainWindow):
         if DEBUG_MODE:
             logging.getLogger("rdm").debug(f"play_random_clip: queue_len={len(self.play_queue)}, idx={self.queue_index}, shared_pool={self._session_shared_pool}, in_session={client is not None}")
 
+        # Session queue takes priority (like Spotify queue)
+        if client and client.is_host and self._session_queue:
+            client.send_queue_play_next()
+            self.status_label.setText("⏭ Playing next from queue...")
+            return
+
         # In session with shared pool: ask server to pick a random user
         if client and self._session_shared_pool:
             # Use prefetched video if available (already uploaded + downloaded by all)
@@ -3356,16 +3787,18 @@ class VideoPlayer(QMainWindow):
     def open_current_in_explorer(self):
         """Open the folder containing the current clip"""
         if self.current_video and os.path.exists(self.current_video):
-            # Select the file in explorer
-            subprocess_args = f'/select,"{self.current_video}"'
             try:
-                # Use standard Windows command
-                ctypes.windll.shell32.ShellExecuteW(
-                    None, "open", "explorer.exe", subprocess_args, None, 1
-                )
+                if sys.platform == 'win32':
+                    ctypes.windll.shell32.ShellExecuteW(
+                        None, "open", "explorer.exe", f'/select,"{self.current_video}"', None, 1
+                    )
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(['open', '-R', self.current_video])
+                else:
+                    subprocess.Popen(['xdg-open', os.path.dirname(self.current_video)])
             except Exception as e:
-                self.status_label.setText("⚠ Failed to open explorer")
-                logging.getLogger("rdm").warning(f"Explorer error: {e}")
+                self.status_label.setText("⚠ Failed to open file manager")
+                logging.getLogger("rdm").warning(f"File manager error: {e}")
 
     def toggle_like(self):
         """Toggle like status for current clip"""
@@ -3520,6 +3953,10 @@ class VideoPlayer(QMainWindow):
             if client and not client.is_host:
                 self.play_btn.setText("▶  Play")
                 self.status_label.setText("⏳ Waiting for host...")
+            elif client and client.is_host and self._session_queue:
+                # Queue has items — play next from queue instead of random
+                client.send_queue_play_next()
+                self.status_label.setText("⏭ Playing next from queue...")
             else:
                 QTimer.singleShot(50, self.play_random_clip)
         else:
@@ -3963,6 +4400,22 @@ class VideoPlayer(QMainWindow):
         """Upload + share the current clip to the session."""
         client = self._get_session_client()
         if client and self.current_video and os.path.exists(self.current_video):
+            # File size warning (configurable, default 500 MB)
+            file_size = os.path.getsize(self.current_video)
+            warn_mb = self.config_manager.get("upload_size_warning_mb") or 500
+            if warn_mb > 0 and file_size > warn_mb * 1024 * 1024:
+                size_str = self._format_file_size(file_size)
+                reply = QMessageBox.question(
+                    self, "Large File Warning",
+                    f"This clip is {size_str}.\nUpload may take a while. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self._set_session_phase(SessionPhase.IDLE)
+                    self.status_label.setText("Upload cancelled")
+                    return
+
             self._session_uploading = True
             if DEBUG_MODE:
                 logging.getLogger("rdm").debug(f"Auto-sharing: {self.current_video}")
@@ -3971,7 +4424,7 @@ class VideoPlayer(QMainWindow):
                 self._session_panel.progress_label.setText("⏳ Sharing clip...")
                 activity = f"📤 You shared {filename}"
                 if self.show_advanced_info:
-                    size = self._format_file_size(os.path.getsize(self.current_video))
+                    size = self._format_file_size(file_size)
                     activity += f" ({size})"
                 self._session_panel.add_activity(activity)
             client.upload_and_play(self.current_video)
@@ -4020,7 +4473,18 @@ class VideoPlayer(QMainWindow):
     def _request_prefetch(self):
         """Host sends a prefetch request to the server after all_ready."""
         client = self._get_session_client()
-        if client and client.is_host and self._session_shared_pool and len(getattr(client, '_videos', {})) >= 0:
+        if not client or not client.is_host:
+            return
+        # If session queue has items, prefetch the next queued video
+        if self._session_queue:
+            next_item = self._session_queue[0]
+            vid = next_item.get("video_id", "")
+            if vid:
+                self._prefetch_video_id = vid
+                client.download_video(vid)
+                return
+        # Otherwise, use shared pool prefetch
+        if self._session_shared_pool and len(getattr(client, '_videos', {})) >= 0:
             client.send_request_prefetch()
 
     def _on_prefetch_clip_requested(self):
