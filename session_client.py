@@ -660,8 +660,6 @@ class SessionClient:
                 filename = data.get("filename", "")
                 user = data.get("user", "")
                 self.signals.remote_play_video.emit(video_id, filename, user)
-                # Auto-download the video
-                self.download_video(video_id)
 
             elif msg_type == "prepare_video":
                 # Ready-sync: emit signal → UI streams from URL and downloads in background

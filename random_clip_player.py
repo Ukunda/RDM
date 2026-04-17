@@ -2289,6 +2289,10 @@ class SessionPanel(QFrame):
             QTimer.singleShot(500, _apply_sync)
             self._player._set_session_phase(SessionPhase.IDLE)
             self._pending_sync_state = {}
+        else:
+            # No stream URL and no local path — download will trigger video_ready
+            if self.session_client:
+                self.session_client.download_video(video_id)
 
     def _on_user_joined(self, username, users):
         self._update_users_list(users)
@@ -2608,7 +2612,10 @@ class SessionPanel(QFrame):
             if not local_path and self.session_client:
                 self.session_client.download_video(video_id)
         else:
+            # No stream URL and no local path — fall back to full download
             self.progress_label.setText(f"⬇ Downloading from {username}...")
+            if self.session_client:
+                self.session_client.download_video(video_id)
 
     def _on_all_ready(self, video_id, uploaded_by=""):
         """Everyone is ready — start playback from the beginning."""
@@ -3040,7 +3047,7 @@ class VideoPlayer(QMainWindow):
             keep_open=True,
             af='scaletempo2',  # Pitch-correct audio at variable playback speeds
             # Network streaming: aggressive caching for instant playback start
-            cache=True,
+            cache='auto',  # Cache network streams only, not local files
             demuxer_max_bytes='150M',        # Buffer up to 150MB ahead
             demuxer_max_back_bytes='50M',    # Keep 50MB behind for seeks
             demuxer_readahead_secs=120,      # Read ahead 120 seconds
