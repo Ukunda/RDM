@@ -36,15 +36,21 @@ except ImportError:
     SessionClient = None  # type: ignore[assignment,misc]
     SESSION_AVAILABLE = False
 
-# Handle Nuitka MPV dll bundling so python-mpv can find mpv-1.dll
+# Help python-mpv find libmpv on each platform
 if "__compiled__" in globals():
-    # Running as compiled Nuitka executable
     base_dir = os.path.dirname(sys.executable)
-    os.environ["PATH"] = os.path.join(base_dir, "lib") + os.pathsep + os.environ.get("PATH", "")
 else:
-    # Running from source
     base_dir = os.path.dirname(os.path.abspath(__file__))
+
+if sys.platform == "win32":
+    # Windows: bundled mpv-1.dll in lib/
     os.environ["PATH"] = os.path.join(base_dir, "lib") + os.pathsep + os.environ.get("PATH", "")
+elif sys.platform == "darwin":
+    # macOS: Homebrew installs to /opt/homebrew (ARM) or /usr/local (Intel)
+    for brew_lib in ["/opt/homebrew/lib", "/usr/local/lib"]:
+        if os.path.isfile(os.path.join(brew_lib, "libmpv.dylib")):
+            os.environ["DYLD_LIBRARY_PATH"] = brew_lib + os.pathsep + os.environ.get("DYLD_LIBRARY_PATH", "")
+            break
 
 import mpv
 
