@@ -2971,13 +2971,14 @@ class VideoPlayer(QMainWindow):
 
         # MPV instance and player — create AFTER UI is fully styled
         mpv_opts = dict(
-            wid=int(self.video_frame.winId()),
             keep_open=True,
             af='scaletempo2',  # Pitch-correct audio at variable playback speeds
         )
         if sys.platform == "darwin":
-            mpv_opts["vo"] = "libmpv"
+            # macOS: pass wid as string; let mpv auto-select vo
+            mpv_opts["wid"] = str(int(self.video_frame.winId()))
         else:
+            mpv_opts["wid"] = int(self.video_frame.winId())
             mpv_opts["vo"] = "gpu"
             mpv_opts["hwdec"] = "auto"
         self.player = mpv.MPV(**mpv_opts)
