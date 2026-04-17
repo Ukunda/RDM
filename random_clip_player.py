@@ -6,6 +6,7 @@ Version 4.5 - Bugfix & Stability
 
 import sys
 import os
+import locale
 import json
 import random
 import ctypes
@@ -16,6 +17,9 @@ import threading
 import argparse
 import logging
 import traceback
+
+# libmpv requires LC_NUMERIC to be "C" — set this before importing mpv
+locale.setlocale(locale.LC_NUMERIC, "C")
 from enum import Enum
 from pathlib import Path
 from PySide6.QtWidgets import (
@@ -37,7 +41,11 @@ except ImportError:
     SESSION_AVAILABLE = False
 
 # Help python-mpv find libmpv on each platform
-if "__compiled__" in globals():
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # PyInstaller one-file build: extracted files are in _MEIPASS
+    base_dir = sys._MEIPASS
+elif "__compiled__" in globals():
+    # Nuitka
     base_dir = os.path.dirname(sys.executable)
 else:
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -46,11 +54,23 @@ if sys.platform == "win32":
     # Windows: bundled mpv-1.dll in lib/
     os.environ["PATH"] = os.path.join(base_dir, "lib") + os.pathsep + os.environ.get("PATH", "")
 elif sys.platform == "darwin":
-    # macOS: Homebrew installs to /opt/homebrew (ARM) or /usr/local (Intel)
-    for brew_lib in ["/opt/homebrew/lib", "/usr/local/lib"]:
-        if os.path.isfile(os.path.join(brew_lib, "libmpv.dylib")):
-            os.environ["DYLD_LIBRARY_PATH"] = brew_lib + os.pathsep + os.environ.get("DYLD_LIBRARY_PATH", "")
-            break
+    # macOS: DYLD_LIBRARY_PATH is stripped by SIP.
+    # python-mpv uses ctypes.util.find_library('mpv') at import time, which returns None
+    # when libmpv is not installed system-wide. Patch find_library to return our bundled path.
+    import ctypes.util as _ctypes_util
+    _mpv_candidates = [
+        os.path.join(base_dir, "lib", "libmpv.dylib"),
+        "/opt/homebrew/lib/libmpv.dylib",
+        "/usr/local/lib/libmpv.dylib",
+    ]
+    _bundled_mpv_path = next((p for p in _mpv_candidates if os.path.isfile(p)), None)
+    if _bundled_mpv_path:
+        _orig_find_library = _ctypes_util.find_library
+        def _patched_find_library(name):
+            if name == 'mpv':
+                return _bundled_mpv_path
+            return _orig_find_library(name)
+        _ctypes_util.find_library = _patched_find_library
 
 import mpv
 
@@ -4798,6 +4818,8 @@ def main():
 
     # Note: High DPI scaling is always enabled in Qt6/PySide6
     app = QApplication(sys.argv)
+    # Qt resets LC_NUMERIC on startup; libmpv requires it to be "C" to avoid a segfault
+    locale.setlocale(locale.LC_NUMERIC, "C")
     app.setApplicationName("Random Clip Player")
     app.setStyle('Fusion')
     

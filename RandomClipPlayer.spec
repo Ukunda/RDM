@@ -4,8 +4,9 @@
 a = Analysis(
     ['random_clip_player.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('lib/libmpv.dylib', 'lib')] if __import__('sys').platform == 'darwin' else [],
     datas=[('lib', 'lib')],
+
     hiddenimports=['session_client'],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +36,16 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+app = BUNDLE(
+    exe,
+    name='RandomClipPlayer.app',
+    icon=None,
+    bundle_identifier='com.rdm.randomclipplayer',
+    info_plist={
+        'NSHighResolutionCapable': True,
+        'LSUIElement': False,
+        'CFBundleShortVersionString': '4.5.0',
+    },
 )
