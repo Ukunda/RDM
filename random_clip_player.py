@@ -2258,9 +2258,37 @@ class SessionPanel(QFrame):
         """Sync to the video currently playing when joining mid-session."""
         self.add_activity(f"🔄 Syncing to: {filename}")
         self.now_playing_label.setText(f"▶ {filename}")
-        self._pending_sync_state = playback_state  # Will be applied once video_ready fires
+        self._pending_sync_state = playback_state  # Will be applied once video loads
         if self._player:
             self._player._set_session_phase(SessionPhase.SYNCING, video_id)
+
+        # Stream from URL immediately — don't wait for full download
+        local_path = self.session_client.get_local_video_path(video_id) if self.session_client else None
+        stream_url = self.session_client.get_stream_url(video_id) if self.session_client else None
+        source = local_path or stream_url
+        if source and self._player:
+            self.progress_label.setText("▶ Loading stream...")
+            self._player._play_session_video(video_id, source)
+            position = playback_state.get('position', 0.0)
+            speed = playback_state.get('speed', 1.0)
+            is_playing = playback_state.get('playing', False)
+            def _apply_sync():
+                if not self._player or not self._player.player:
+                    return
+                self._player._ignore_remote = True
+                if position > 0.01:
+                    self._player.player.seek(position, reference='absolute')
+                if speed != 1.0:
+                    self._player.player.speed = speed
+                    self._player.slow_mo_btn.set_speed(speed)
+                if not is_playing:
+                    self._player.player.pause = True
+                    self._player.play_btn.setText("▶  Play")
+                self._player._ignore_remote = False
+                self.add_activity("🔄 Synced to position")
+            QTimer.singleShot(500, _apply_sync)
+            self._player._set_session_phase(SessionPhase.IDLE)
+            self._pending_sync_state = {}
 
     def _on_user_joined(self, username, users):
         self._update_users_list(users)
@@ -2471,41 +2499,55 @@ class SessionPanel(QFrame):
         phase = self._player._session_phase if self._player else SessionPhase.IDLE
         phase_vid = self._player._phase_video_id if self._player else None
 
-        # If this was a join-in-progress sync, play immediately with sync state
+        # READY_WAIT: we're already streaming from URL — just cache the local path,
+        # don't reload the video (it's already loaded/paused).
+        if phase == SessionPhase.READY_WAIT and phase_vid == video_id:
+            QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+            return
+
+        # If this was a join-in-progress sync — download finished after we
+        # already started streaming.  Don't interrupt if already playing.
         if phase == SessionPhase.SYNCING and phase_vid == video_id:
             if self._player:
-                self._player._play_session_video(video_id, local_path)
+                # Only load from local if we haven't started playing yet
+                cur = self._player.current_video or ""
+                already_playing = cur.startswith("http://") or cur.startswith("https://") or os.path.normpath(cur) == os.path.normpath(local_path)
+                if not already_playing:
+                    self._player._play_session_video(video_id, local_path)
                 sync_state = getattr(self, '_pending_sync_state', {})
-                position = sync_state.get('position', 0.0)
-                speed = sync_state.get('speed', 1.0)
-                is_playing = sync_state.get('playing', False)
-                def _apply_sync():
-                    if not self._player or not self._player.player:
-                        return
-                    self._player._ignore_remote = True
-                    if position > 0.01:
-                        self._player.player.seek(position, reference='absolute')
-                    if speed != 1.0:
-                        self._player.player.speed = speed
-                        self._player.slow_mo_btn.set_speed(speed)
-                    if not is_playing:
-                        self._player.player.pause = True
-                        self._player.play_btn.setText("▶  Play")
-                    self._player._ignore_remote = False
-                    self.add_activity("🔄 Synced to position")
-                QTimer.singleShot(500, _apply_sync)
+                if sync_state:
+                    position = sync_state.get('position', 0.0)
+                    speed = sync_state.get('speed', 1.0)
+                    is_playing = sync_state.get('playing', False)
+                    def _apply_sync():
+                        if not self._player or not self._player.player:
+                            return
+                        self._player._ignore_remote = True
+                        if position > 0.01:
+                            self._player.player.seek(position, reference='absolute')
+                        if speed != 1.0:
+                            self._player.player.speed = speed
+                            self._player.slow_mo_btn.set_speed(speed)
+                        if not is_playing:
+                            self._player.player.pause = True
+                            self._player.play_btn.setText("▶  Play")
+                        self._player._ignore_remote = False
+                        self.add_activity("🔄 Synced to position")
+                    QTimer.singleShot(500, _apply_sync)
             if self._player:
                 self._player._set_session_phase(SessionPhase.IDLE)
             self._pending_sync_state = {}
             QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
             return
 
-        # Ready-sync (non-host): load video, pause, report ready, wait for all_ready
+        # DOWNLOADING: _on_prepare_video already streamed from URL — this is
+        # just the background cache finishing.  Ignore (already in READY_WAIT).
         if phase == SessionPhase.DOWNLOADING and phase_vid == video_id:
-            if self._player:
+            # Fallback: if prepare_video didn't stream (no URL), load now
+            if self._player and not self._player.current_video:
                 self._player._load_session_video(local_path)
                 self._player._set_session_phase(SessionPhase.READY_WAIT, video_id)
-                QTimer.singleShot(200, lambda: self._pause_and_report_ready(video_id))
+                QTimer.singleShot(100, lambda: self._pause_and_report_ready(video_id))
             QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
             return
 
@@ -2514,7 +2556,7 @@ class SessionPanel(QFrame):
             if self._player:
                 self._player._phase_video_id = video_id  # Now known after upload
                 self._player._load_session_video(local_path)
-                QTimer.singleShot(200, lambda: self._host_wait_for_ready(video_id))
+                QTimer.singleShot(100, lambda: self._host_wait_for_ready(video_id))
             QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
             return
 
@@ -2546,12 +2588,27 @@ class SessionPanel(QFrame):
             self.session_client.send_ready(video_id)
 
     def _on_prepare_video(self, video_id, filename, username):
-        """Server says a new video is coming — download it and wait."""
+        """Server says a new video is coming — stream it directly from the server."""
         if self._player:
             self._player._set_session_phase(SessionPhase.DOWNLOADING, video_id)
         self.add_activity(f"🎬 {username} shared {filename}")
         self.now_playing_label.setText(f"▶ {filename}")
-        self.progress_label.setText(f"⬇ Downloading from {username}...")
+
+        # Try to stream directly from server URL (instant start)
+        stream_url = self.session_client.get_stream_url(video_id) if self.session_client else None
+        local_path = self.session_client.get_local_video_path(video_id) if self.session_client else None
+        source = local_path or stream_url
+
+        if source and self._player:
+            self.progress_label.setText("▶ Loading stream...")
+            self._player._load_session_video(source)
+            self._player._set_session_phase(SessionPhase.READY_WAIT, video_id)
+            QTimer.singleShot(100, lambda: self._pause_and_report_ready(video_id))
+            # Background download for local caching (don't block playback)
+            if not local_path and self.session_client:
+                self.session_client.download_video(video_id)
+        else:
+            self.progress_label.setText(f"⬇ Downloading from {username}...")
 
     def _on_all_ready(self, video_id, uploaded_by=""):
         """Everyone is ready — start playback from the beginning."""
@@ -2569,8 +2626,13 @@ class SessionPanel(QFrame):
             self._player._playing_remote_clip = (uploaded_by != own_id)
             # If the video isn't currently loaded (e.g. queue item), load it first
             local_path = self.session_client.get_local_video_path(video_id) if self.session_client else None
-            if local_path and os.path.normpath(local_path) != os.path.normpath(self._player.current_video or ""):
-                self._player._play_session_video(video_id, local_path)
+            stream_url = self.session_client.get_stream_url(video_id) if self.session_client else None
+            source = local_path or stream_url
+            cur = self._player.current_video or ""
+            cur_matches = (local_path and os.path.normpath(local_path) == os.path.normpath(cur)) or \
+                          (stream_url and cur == stream_url)
+            if source and not cur_matches:
+                self._player._play_session_video(video_id, source)
             else:
                 self._player._ignore_remote = True
                 self._player.player.seek(0, reference='absolute')
@@ -2977,6 +3039,12 @@ class VideoPlayer(QMainWindow):
         mpv_opts = dict(
             keep_open=True,
             af='scaletempo2',  # Pitch-correct audio at variable playback speeds
+            # Network streaming: aggressive caching for instant playback start
+            cache=True,
+            demuxer_max_bytes='150M',        # Buffer up to 150MB ahead
+            demuxer_max_back_bytes='50M',    # Keep 50MB behind for seeks
+            demuxer_readahead_secs=120,      # Read ahead 120 seconds
+            cache_secs=120,                  # Cache 120 seconds of decoded content
         )
         if sys.platform == "darwin":
             # macOS: pass wid as string; let mpv auto-select vo
@@ -4210,13 +4278,15 @@ class VideoPlayer(QMainWindow):
 
     def _show_advanced_video_info(self, filepath):
         """Show advanced video metadata in the status label."""
-        if not self.player or not os.path.exists(filepath):
+        if not self.player:
             return
+        is_url = filepath.startswith("http://") or filepath.startswith("https://")
         try:
             parts = []
-            # File size
-            size = self._format_file_size(os.path.getsize(filepath))
-            parts.append(size)
+            # File size (only for local files)
+            if not is_url and os.path.exists(filepath):
+                size = self._format_file_size(os.path.getsize(filepath))
+                parts.append(size)
             # Resolution from MPV
             vp = self.player.video_params
             if isinstance(vp, dict) and 'w' in vp and 'h' in vp:
@@ -4691,7 +4761,7 @@ class VideoPlayer(QMainWindow):
             self._ignore_remote = False
 
     def _on_remote_play_video(self, video_id, filename, username):
-        """Another user wants to play a video — download it."""
+        """Another user wants to play a video — stream it immediately."""
         if DEBUG_MODE:
             logging.getLogger("rdm").debug(f"Remote PLAY_VIDEO from {username}: {filename} (id={video_id})")
         self._prefetch_video_id = None
@@ -4699,15 +4769,20 @@ class VideoPlayer(QMainWindow):
         self.status_label.setText(f"📥 {username} is sharing: {filename}")
         client = self._get_session_client()
         if client:
-            # Check if we already have it locally
+            # Try local first, then stream URL
             local = client.get_local_video_path(video_id)
-            if local:
-                self._play_session_video(video_id, local)
-            # Otherwise download_video was already triggered by session_client
+            stream_url = client.get_stream_url(video_id)
+            source = local or stream_url
+            if source:
+                self._play_session_video(video_id, source)
+                # Background-cache if streaming
+                if not local:
+                    client.download_video(video_id)
 
     def _play_session_video(self, video_id, local_path):
-        """Play a session video that has been downloaded locally."""
-        if os.path.exists(local_path):
+        """Play a session video from a local path or stream URL."""
+        is_url = local_path.startswith("http://") or local_path.startswith("https://")
+        if is_url or os.path.exists(local_path):
             self._ignore_remote = True
             self._playing_remote_clip = True  # Don't re-share when this clip ends
             self.current_video = local_path
@@ -4716,8 +4791,10 @@ class VideoPlayer(QMainWindow):
 
     def _load_session_video(self, local_path):
         """Load a session video into the player but don't start playback.
+        Accepts local file paths or HTTP stream URLs.
         Used for ready-sync: load the video, pause, then wait for all_ready."""
-        if os.path.exists(local_path) and self.player:
+        is_url = local_path.startswith("http://") or local_path.startswith("https://")
+        if (is_url or os.path.exists(local_path)) and self.player:
             self._ignore_remote = True
             self._playing_remote_clip = True
             self.current_video = local_path

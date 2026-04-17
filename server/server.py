@@ -650,7 +650,7 @@ async def stream_video(room_code: str, video_id: str, request: Request):
                 await f.seek(start)
                 remaining = content_length
                 while remaining > 0:
-                    chunk_sz = min(65536, remaining)
+                    chunk_sz = min(262144, remaining)  # 256KB chunks for fast streaming
                     data = await f.read(chunk_sz)
                     if not data:
                         break
@@ -672,7 +672,7 @@ async def stream_video(room_code: str, video_id: str, request: Request):
         async def full_file():
             async with aiofiles.open(filepath, "rb") as f:
                 while True:
-                    data = await f.read(65536)
+                    data = await f.read(262144)  # 256KB chunks for fast streaming
                     if not data:
                         break
                     yield data

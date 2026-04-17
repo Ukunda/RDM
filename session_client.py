@@ -13,6 +13,7 @@ import threading
 import tempfile
 import logging
 import shutil
+import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ import websocket  # websocket-client library
 log = logging.getLogger("rdm-session")
 
 CHUNK_SIZE = 5 * 1024 * 1024  # 5MB — sweet spot for resumable uploads
+UPLOAD_WORKERS = 3            # Number of parallel chunk upload threads
 DOWNLOAD_SEGMENTS = 3         # Number of parallel download segments
 PARALLEL_DOWNLOAD_THRESHOLD = 10 * 1024 * 1024  # 10MB — below this, single-stream is fine
 
@@ -447,6 +449,12 @@ class SessionClient:
                 return path
         return None
 
+    def get_stream_url(self, video_id: str) -> Optional[str]:
+        """Get the HTTP streaming URL for a video on the server."""
+        if self._server_url and self._room_code:
+            return f"{self._server_url}/rooms/{self._room_code}/videos/{video_id}"
+        return None
+
     # ====================================================================
     # Internal: Room Creation/Joining
     # ====================================================================
@@ -656,13 +664,11 @@ class SessionClient:
                 self.download_video(video_id)
 
             elif msg_type == "prepare_video":
-                # New ready-sync: download the video, then report ready
+                # Ready-sync: emit signal → UI streams from URL and downloads in background
                 video_id = data.get("video_id", "")
                 filename = data.get("filename", "")
                 user = data.get("user", "")
                 self.signals.prepare_video.emit(video_id, filename, user)
-                # Auto-download — when done, video_ready signal fires → UI sends ready
-                self.download_video(video_id)
 
             elif msg_type == "all_ready":
                 # Everyone has downloaded — start playback
@@ -769,7 +775,7 @@ class SessionClient:
     # ====================================================================
 
     def _upload_thread(self, filepath: str, prefetch: bool = False, skip_play: bool = False):
-        """Upload a video file using resumable chunked upload, then tell the room to play it."""
+        """Upload a video file using parallel chunked upload, then tell the room to play it."""
         try:
             if not os.path.exists(filepath):
                 self.signals.room_error.emit(f"File not found: {filepath}")
@@ -799,69 +805,76 @@ class SessionClient:
             upload_id = init_data["upload_id"]
             total_chunks = init_data["total_chunks"]
 
-            # --- Phase 2: Upload chunks with retry + resume ---
-            bytes_sent = 0
-            start_index = 0
+            # --- Phase 2: Parallel chunk upload with retry ---
+            upload_failed = threading.Event()
+            upload_error_msg = [""]
+            chunks_done = [0]  # Mutable counter for progress
+            lock = threading.Lock()
 
-            with open(filepath, "rb") as f:
-                for chunk_idx in range(start_index, total_chunks):
+            def _upload_one_chunk(chunk_idx: int) -> bool:
+                """Upload a single chunk with retry. Returns True on success."""
+                if upload_failed.is_set():
+                    return False
+                # Read chunk data
+                with open(filepath, "rb") as f:
                     f.seek(chunk_idx * CHUNK_SIZE)
                     chunk_data = f.read(CHUNK_SIZE)
-                    if not chunk_data:
-                        break
+                if not chunk_data:
+                    return True
 
-                    # Retry each chunk up to 3 times
-                    for attempt in range(3):
-                        try:
-                            chunk_resp = requests.put(
-                                f"{base_url}/{upload_id}/chunk/{chunk_idx}",
-                                data=chunk_data,
-                                headers={"Content-Type": "application/octet-stream"},
-                                timeout=120,
-                            )
-                            if chunk_resp.status_code == 200:
-                                break
-                            try:
-                                error = chunk_resp.json().get("detail", chunk_resp.text)
-                            except (ValueError, KeyError):
-                                error = chunk_resp.text
-                            log.warning(f"Chunk {chunk_idx} failed (attempt {attempt+1}): {error}")
-                            if attempt < 2:
-                                time.sleep(2 ** attempt)
-                        except requests.ConnectionError:
-                            log.warning(f"Chunk {chunk_idx} connection error (attempt {attempt+1})")
-                            if attempt < 2:
-                                # Resume: ask server where we left off
-                                time.sleep(2 ** attempt)
-                                try:
-                                    status_resp = requests.get(
-                                        f"{base_url}/{upload_id}/status",
-                                        timeout=15,
-                                    )
-                                    if status_resp.status_code == 200:
-                                        status = status_resp.json()
-                                        bytes_sent = status["received_bytes"]
-                                        if not prefetch:
-                                            self.signals.upload_progress.emit(bytes_sent, file_size)
-                                except Exception:
-                                    pass
-                                continue
-                            self.signals.room_error.emit("Upload failed: connection lost")
-                            return
-                        except requests.Timeout:
-                            log.warning(f"Chunk {chunk_idx} timeout (attempt {attempt+1})")
-                            if attempt == 2:
-                                self.signals.room_error.emit("Upload failed: timeout")
-                                return
+                for attempt in range(3):
+                    if upload_failed.is_set():
+                        return False
+                    try:
+                        chunk_resp = requests.put(
+                            f"{base_url}/{upload_id}/chunk/{chunk_idx}",
+                            data=chunk_data,
+                            headers={"Content-Type": "application/octet-stream"},
+                            timeout=120,
+                        )
+                        if chunk_resp.status_code == 200:
+                            with lock:
+                                chunks_done[0] += 1
+                                sent = min(chunks_done[0] * CHUNK_SIZE, file_size)
+                                if not prefetch:
+                                    self.signals.upload_progress.emit(sent, file_size)
+                            return True
+                        log.warning(f"Chunk {chunk_idx} failed (attempt {attempt+1})")
+                        if attempt < 2:
                             time.sleep(2 ** attempt)
-                    else:
-                        # All 3 attempts failed for non-exception case
-                        self.signals.room_error.emit(f"Upload failed at chunk {chunk_idx}")
-                        return
+                    except requests.ConnectionError:
+                        log.warning(f"Chunk {chunk_idx} connection error (attempt {attempt+1})")
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                            continue
+                        upload_failed.set()
+                        upload_error_msg[0] = "Upload failed: connection lost"
+                        return False
+                    except requests.Timeout:
+                        log.warning(f"Chunk {chunk_idx} timeout (attempt {attempt+1})")
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                            continue
+                        upload_failed.set()
+                        upload_error_msg[0] = "Upload failed: timeout"
+                        return False
+                upload_failed.set()
+                upload_error_msg[0] = f"Upload failed at chunk {chunk_idx}"
+                return False
 
-                    bytes_sent = min((chunk_idx + 1) * CHUNK_SIZE, file_size)
-                    if not prefetch:
-                        self.signals.upload_progress.emit(bytes_sent, file_size)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
+                futures = [
+                    executor.submit(_upload_one_chunk, idx)
+                    for idx in range(total_chunks)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    if upload_failed.is_set():
+                        break
+                    future.result()
+
+            if upload_failed.is_set():
+                self.signals.room_error.emit(upload_error_msg[0])
+                return
 
             # --- Phase 3: Complete ---
             resp = requests.post(
@@ -961,8 +974,6 @@ class SessionClient:
 
     def _parallel_download(self, url: str, local_path: str, total_size: int):
         """Download a file using multiple parallel Range requests."""
-        import concurrent.futures
-
         num_segments = DOWNLOAD_SEGMENTS
         segment_size = total_size // num_segments
         segments = []
