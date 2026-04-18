@@ -2480,6 +2480,10 @@ class SessionPanel(QFrame):
             overlay.update_progress(sent, total)
 
     def _on_download_progress(self, recv, total):
+        # Suppress download UI during background caching (stream already playing)
+        phase = self._player._session_phase if self._player else SessionPhase.IDLE
+        if phase in (SessionPhase.READY_WAIT, SessionPhase.IDLE):
+            return
         if total > 0:
             pct = int(recv / total * 100)
             self.progress_label.setText(f"⬇ Downloading: {pct}%")
@@ -2580,6 +2584,15 @@ class SessionPanel(QFrame):
             QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
             return
 
+        # If already streaming this video, just swap to local path — don't restart
+        if self._player and self.session_client:
+            cur = self._player.current_video or ""
+            stream_url = self.session_client.get_stream_url(video_id)
+            if stream_url and cur == stream_url:
+                self._player.current_video = local_path
+                QTimer.singleShot(3000, lambda: self.progress_label.setText(""))
+                return
+
         # Fallback: connected or not — just play
         if self._player:
             self._player._play_session_video(video_id, local_path)
@@ -2624,9 +2637,8 @@ class SessionPanel(QFrame):
             self._player._load_session_video(source)
             self._player._set_session_phase(SessionPhase.READY_WAIT, video_id)
             QTimer.singleShot(100, lambda: self._pause_and_report_ready(video_id))
-            # Background download for local caching (don't block playback)
-            if not local_path and self.session_client:
-                self.session_client.download_video(video_id)
+            # Background download deferred to _on_all_ready to avoid bandwidth
+            # contention between mpv streaming and HTTP download
         else:
             # No stream URL and no local path — fall back to full download
             self.progress_label.setText(f"⬇ Downloading from {username}...")
@@ -2669,6 +2681,12 @@ class SessionPanel(QFrame):
             # Start prefetch timer (host only, shared pool, >1 user)
             if self._player.is_host_in_session() and self._player._session_shared_pool:
                 self._player._prefetch_timer.start()
+            # Start background download for local caching (deferred from _on_prepare_video
+            # to avoid bandwidth contention with mpv streaming)
+            if self.session_client:
+                local_path_cached = self.session_client.get_local_video_path(video_id)
+                if not local_path_cached:
+                    self.session_client.download_video(video_id)
 
     def _on_ready_progress(self, ready_count, total):
         """Show how many users are ready."""
@@ -4787,6 +4805,11 @@ class VideoPlayer(QMainWindow):
         """Another user wants to play a video — stream it immediately."""
         if DEBUG_MODE:
             logging.getLogger("rdm").debug(f"Remote PLAY_VIDEO from {username}: {filename} (id={video_id})")
+        # Ignore if we're mid-transition (downloading, waiting for ready, etc.)
+        if self._session_phase not in (SessionPhase.IDLE, SessionPhase.SYNCING):
+            if DEBUG_MODE:
+                logging.getLogger("rdm").debug(f"Ignoring PLAY_VIDEO — phase is {self._session_phase.value}")
+            return
         self._prefetch_video_id = None
         self._prefetch_timer.stop()
         self.status_label.setText(f"📥 {username} is sharing: {filename}")
